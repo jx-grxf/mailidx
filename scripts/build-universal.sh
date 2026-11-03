@@ -8,5 +8,6 @@ mkdir -p dist
 lipo -create -output dist/mailidx \
   target/aarch64-apple-darwin/release/mailidx \
   target/x86_64-apple-darwin/release/mailidx
-tar -C dist -czf dist/mailidx-macos-universal.tar.gz mailidx
-shasum -a 256 dist/mailidx-macos-universal.tar.gz | tee dist/mailidx-macos-universal.tar.gz.sha256
+cd dist
+tar -czf mailidx-macos-universal.tar.gz mailidx
+shasum -a 256 mailidx-macos-universal.tar.gz | tee mailidx-macos-universal.tar.gz.sha256
