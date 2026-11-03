@@ -14,6 +14,7 @@ use serde_json::json;
 use crate::emlx;
 use crate::fts::Index;
 use crate::script::{self, Kind, MsgRef, Outgoing};
+use crate::signature::Signatures;
 use crate::store::{Filter, MessageRow, Role, Store, category_id, format_addr, truncate_chars};
 use crate::time::{fmt_ts, now, parse_when};
 
@@ -912,7 +913,7 @@ impl Server {
                     let base = emlx::sanitize_filename(&format!(
                         "{} {}",
                         r.date.get(..10).unwrap_or(""),
-                        truncate_chars(&r.subject, 60).trim_end_matches('…')
+                        truncate_chars(&r.subject, 60).trim_end_matches(['…', '.', ' '])
                     ));
                     match format.as_str() {
                         "eml" => {
@@ -1187,6 +1188,7 @@ impl Server {
             }
             refs.push(r);
         }
+        let mut moved_to: Option<(i64, Vec<(i64, i64)>)> = None;
         let res = match a.action.as_str() {
             "mark_read" => script::set_status(&refs, "read", "true").await,
             "mark_unread" => script::set_status(&refs, "read", "false").await,
@@ -1213,18 +1215,29 @@ impl Server {
                     return fail(anyhow!("move needs a mailbox"));
                 };
                 let account = a.account.clone().unwrap_or(first_account);
+                let ids = a.ids.clone();
                 let dest = tri!(
                     self.with(move |s, _| {
-                        let ids = s.resolve_mailboxes(&target, Some(&account))?;
-                        let mbs: Vec<_> = ids.iter().filter_map(|i| s.mailbox(*i)).collect();
+                        let mb_ids = s.resolve_mailboxes(&target, Some(&account))?;
+                        let mbs: Vec<_> = mb_ids.iter().filter_map(|i| s.mailbox(*i)).collect();
                         let mb = mbs
                             .iter()
                             .max_by_key(|m| m.total)
                             .ok_or_else(|| anyhow!("no such mailbox"))?;
-                        Ok((if mb.local { String::new() } else { mb.account.clone() }, mb.path.clone()))
+                        let globals = ids
+                            .iter()
+                            .filter_map(|id| s.global_id(*id).ok().map(|g| (*id, g)))
+                            .collect::<Vec<_>>();
+                        Ok((
+                            if mb.local { String::new() } else { mb.account.clone() },
+                            mb.path.clone(),
+                            mb.id,
+                            globals,
+                        ))
                     })
                     .await
                 );
+                moved_to = Some((dest.2, dest.3));
                 script::move_to(&refs, &dest.0, &dest.1).await.map(|r| format!("{r}\n→ {}", dest.1))
             }
             other => return fail(anyhow!("unknown action '{other}'")),
@@ -1233,7 +1246,14 @@ impl Server {
         let mut lines = out.lines();
         let done: usize = lines.next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
         let errors: Vec<&str> = lines.filter(|l| !l.trim().is_empty() && !l.starts_with('→')).collect();
-        ok(&json!({ "action": a.action, "changed": done, "requested": a.ids.len(), "errors": errors }))
+        let mut result = json!({ "action": a.action, "changed": done, "requested": a.ids.len(), "errors": errors });
+        if let Some((mailbox_id, globals)) = moved_to
+            && done > 0
+        {
+            let new_ids = self.find_moved(mailbox_id, globals).await;
+            result["new_ids"] = json!(new_ids);
+        }
+        ok(&result)
     }
 
     #[tool(
@@ -1269,10 +1289,14 @@ impl Server {
                             bail!("message {id} is not in a drafts mailbox");
                         }
                         let recipients = s.recipients(id)?;
+                        let sigs = Signatures::load(&s.mail_root);
                         load_parsed(s, id, |e, m| {
                             std::fs::create_dir_all(&t2)?;
                             let mut atts = Vec::new();
-                            for i in 0..m.attachments().count() {
+                            for (i, part) in m.attachments().enumerate() {
+                                if part.content_id().is_some_and(|c| sigs.is_signature_image(c)) {
+                                    continue;
+                                }
                                 let (name, data) = emlx::attachment_bytes(e, m, i)?;
                                 let p = unique_path(&t2, &name);
                                 std::fs::write(&p, data)?;
@@ -1288,7 +1312,7 @@ impl Server {
                             Ok(Outgoing {
                                 html: None,
                                 subject: m.subject().unwrap_or("").to_string(),
-                                body: emlx::body_text(m),
+                                body: sigs.strip(&emlx::body_text(m)),
                                 from: emlx::addresses(m.from()).into_iter().next().unwrap_or_default(),
                                 to: pick("to"),
                                 cc: pick("cc"),
@@ -1326,7 +1350,13 @@ impl Server {
                 }
             }
         };
-        tri!(script::create_mailbox(&account, &a.name).await);
+        if tri!(script::create_mailbox(&account, &a.name).await) != "ok" {
+            return fail(anyhow!(
+                "Mail has not shown mailbox '{}' after 3 s. On IMAP accounts the server can take longer; \
+                 check the mailboxes tool before trying again.",
+                a.name
+            ));
+        }
         ok(&json!({ "created": a.name, "account": account }))
     }
 
@@ -1345,6 +1375,32 @@ impl Server {
 }
 
 impl Server {
+    /// Old id → new id for each moved message, as far as Mail has indexed it within ~3 s.
+    async fn find_moved(&self, mailbox_id: i64, globals: Vec<(i64, i64)>) -> HashMap<String, i64> {
+        let mut found = HashMap::new();
+        for _ in 0..12 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let pending: Vec<(i64, i64)> =
+                globals.iter().filter(|(old, _)| !found.contains_key(&old.to_string())).copied().collect();
+            if pending.is_empty() {
+                break;
+            }
+            let hits = self
+                .with(move |s, _| {
+                    Ok(pending
+                        .iter()
+                        .filter_map(|(old, g)| s.id_in_mailbox(*g, mailbox_id).ok().flatten().map(|n| (*old, n)))
+                        .collect::<Vec<_>>())
+                })
+                .await
+                .unwrap_or_default();
+            for (old, new) in hits {
+                found.insert(old.to_string(), new);
+            }
+        }
+        found
+    }
+
     async fn find_draft(&self, subject: &str) -> Option<i64> {
         for _ in 0..12 {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1460,7 +1516,7 @@ fn awaiting_reply(s: &Store, me: &HashSet<String>, since: i64, limit: usize) -> 
 }
 
 const INSTRUCTIONS: &str = "mailidx reads Apple Mail's own index and message files directly, so every read tool is instant and Mail.app does not need to do anything. \
-Start with overview or search. Message ids are stable and work in every tool. \
+Start with overview or search. Message ids work in every tool; moving a message gives it a new id, which update_messages returns as new_ids. \
 Writing tools (compose, reply, forward, update_messages, drafts, create_mailbox, check_mail) go through Mail via AppleScript; compose/reply/forward save drafts unless send=true. \
 Only set send=true when the user clearly asked to send. Permanent deletion is not available; trash moves to the account's trash.";
 

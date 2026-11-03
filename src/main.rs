@@ -1,6 +1,7 @@
 mod emlx;
 mod fts;
 mod script;
+mod signature;
 mod store;
 mod time;
 mod tools;

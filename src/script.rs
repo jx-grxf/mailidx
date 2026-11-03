@@ -309,8 +309,6 @@ on pasteIntoMail(subj)
         -- Mail focuses the To field when recipients are set; the paste must land in the body.
         set webArea to my findWebArea(cw, 0)
         if webArea is missing value then error "message body not found in the compose window"
-        set value of attribute "AXFocused" of webArea to true
-        delay 0.3
         -- Edit is the 4th menu (Apple, Mail, File, Edit) in every language; Paste is the item bound to plain Cmd+V.
         set pasteItem to missing value
         repeat with mi in (menu items of menu 1 of menu bar item 4 of menu bar 1)
@@ -322,6 +320,12 @@ on pasteIntoMail(subj)
             end try
         end repeat
         if pasteItem is missing value then error "Mail's Paste menu item was not found"
+        -- While Mail is still laying out attachments or the signature, the body is not yet editable and Paste stays disabled.
+        repeat 15 times
+            set value of attribute "AXFocused" of webArea to true
+            delay 0.3
+            if enabled of pasteItem then exit repeat
+        end repeat
         if not (enabled of pasteItem) then error "Mail's Paste menu item is disabled; nothing was pasted"
         perform action "AXPress" of pasteItem
     end tell
@@ -452,14 +456,29 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
 pub async fn create_mailbox(account: &str, name: &str) -> Result<String> {
     run(
         r#"
+    set acc to item 1 of argv
+    set nm to item 2 of argv
     tell application "Mail"
-        if (item 1 of argv) is "" then
-            make new mailbox with properties {name:(item 2 of argv)}
+        if acc is "" then
+            make new mailbox with properties {name:nm}
         else
-            tell account (item 1 of argv) to make new mailbox with properties {name:(item 2 of argv)}
+            tell account acc to make new mailbox with properties {name:nm}
         end if
+        -- Mail returns before an IMAP server has created the folder, and a nested
+        -- iCloud folder once showed up only minutes later.
+        repeat 10 times
+            try
+                if acc is "" then
+                    get name of mailbox nm
+                else
+                    get name of mailbox nm of account acc
+                end if
+                return "ok"
+            end try
+            delay 0.3
+        end repeat
     end tell
-    return "ok"
+    return "missing"
 "#,
         &[account.to_string(), name.to_string()],
     )

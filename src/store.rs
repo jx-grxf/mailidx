@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use percent_encoding::percent_decode_str;
-use rusqlite::{Connection, OpenFlags, params_from_iter, types::Value};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter, types::Value};
 use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
@@ -18,7 +18,7 @@ const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
         &[
             "ROWID", "sender", "subject_prefix", "subject", "summary", "date_sent",
             "date_received", "mailbox", "flags", "read", "flagged", "deleted", "size",
-            "conversation_id", "list_id_hash", "automated_conversation",
+            "conversation_id", "list_id_hash", "automated_conversation", "global_message_id",
         ],
     ),
     ("mailboxes", &["ROWID", "url", "total_count", "unread_count"]),
@@ -469,13 +469,11 @@ impl Store {
             sql.push_str(" AND m.conversation_id = ?");
             args.push(c.into());
         }
-        if f.ids.is_none() || f.limit > 0 {
-            sql.push_str(if f.oldest_first {
-                " ORDER BY m.date_received ASC"
-            } else {
-                " ORDER BY m.date_received DESC"
-            });
-        }
+        sql.push_str(if f.oldest_first {
+            " ORDER BY m.date_received ASC"
+        } else {
+            " ORDER BY m.date_received DESC"
+        });
         if f.limit > 0 {
             sql.push_str(&format!(" LIMIT {} OFFSET {}", f.limit, f.offset));
         }
@@ -538,6 +536,25 @@ impl Store {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("message {id} not found (deleted or never indexed by Mail)"))
+    }
+
+    /// Mail gives a moved message a new ROWID; `global_message_id` survives the move.
+    pub fn global_id(&self, id: i64) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT global_message_id FROM messages WHERE ROWID = ?", [id], |r| r.get(0))?)
+    }
+
+    pub fn id_in_mailbox(&self, global_id: i64, mailbox_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT ROWID FROM messages WHERE global_message_id = ? AND mailbox = ? AND deleted = 0
+                 ORDER BY ROWID DESC LIMIT 1",
+                [global_id, mailbox_id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     pub fn recipients(&self, id: i64) -> Result<Vec<Recipient>> {
