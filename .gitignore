@@ -2,3 +2,4 @@
 # Obsidian project brain, local only
 Brain/
 .DS_Store
+dist/
