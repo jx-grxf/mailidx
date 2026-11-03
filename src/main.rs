@@ -67,7 +67,7 @@ fn search(q: &str) -> Result<()> {
     let mut store = store::Store::open()?;
     let mut idx = fts::Index::open()?;
     idx.sync(&mut store)?;
-    let hits = idx.search(q, false, 50)?;
+    let hits = idx.search(q, false, false, 50)?;
     let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
     let rows = store.list(&store::Filter { ids: Some(ids.clone()), ..Default::default() })?;
     for id in ids {

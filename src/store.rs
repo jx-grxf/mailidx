@@ -180,13 +180,12 @@ pub fn find_mail_root() -> Result<PathBuf> {
     })?;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if let Some(v) = name.strip_prefix('V').and_then(|n| n.parse::<u32>().ok()) {
-            if e.path().join("MailData/Envelope Index").exists()
+        if let Some(v) = name.strip_prefix('V').and_then(|n| n.parse::<u32>().ok())
+            && e.path().join("MailData/Envelope Index").exists()
                 && best.as_ref().is_none_or(|(b, _)| v > *b)
             {
                 best = Some((v, e.path()));
             }
-        }
     }
     best.map(|(_, p)| p)
         .ok_or_else(|| anyhow!("no ~/Library/Mail/V*/MailData/Envelope Index found"))
@@ -328,11 +327,10 @@ impl Store {
         let acct_ok = |m: &Mailbox| {
             account.is_none_or(|a| m.account.eq_ignore_ascii_case(a) || m.account_uuid == a)
         };
-        if let Ok(id) = spec_n.parse::<i64>() {
-            if self.mailbox(id).is_some() {
+        if let Ok(id) = spec_n.parse::<i64>()
+            && self.mailbox(id).is_some() {
                 return Ok(vec![id]);
             }
-        }
         let exact: Vec<i64> = self
             .mailboxes
             .iter()

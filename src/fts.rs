@@ -196,8 +196,8 @@ impl Index {
         Ok(s)
     }
 
-    pub fn search(&self, query: &str, raw: bool, limit: usize) -> Result<Vec<Hit>> {
-        let q = if raw { query.to_string() } else { build_query(query) };
+    pub fn search(&self, query: &str, raw: bool, any: bool, limit: usize) -> Result<Vec<Hit>> {
+        let q = if raw { query.to_string() } else { build_query(query, any) };
         if q.is_empty() {
             return Ok(Vec::new());
         }
@@ -253,9 +253,9 @@ fn store_meta(store: &Store, todo: &[(i64, i64, bool)]) -> Result<HashMap<i64, S
 }
 
 fn build_doc(id: i64, path: Option<PathBuf>, fallback: Option<String>) -> Doc {
-    if let Some(path) = path {
-        if let Ok(e) = emlx::read(&path) {
-            if let Some(msg) = emlx::parse(&e.raw) {
+    if let Some(path) = path
+        && let Ok(e) = emlx::read(&path)
+            && let Some(msg) = emlx::parse(&e.raw) {
                 let mut recipients = emlx::addresses(msg.to());
                 recipients.extend(emlx::addresses(msg.cc()));
                 let names: Vec<String> =
@@ -270,8 +270,6 @@ fn build_doc(id: i64, path: Option<PathBuf>, fallback: Option<String>) -> Doc {
                     attachments: names.join(" "),
                 };
             }
-        }
-    }
     let fb = fallback.unwrap_or_default();
     let mut it = fb.split('\u{1}');
     Doc {
@@ -288,7 +286,9 @@ fn build_doc(id: i64, path: Option<PathBuf>, fallback: Option<String>) -> Doc {
 /// Turns free text into an FTS5 query: every word must match, each as a prefix,
 /// quoted so punctuation in phone numbers or addresses cannot break the syntax.
 /// `"exact phrase"` stays a phrase, a leading `-` excludes a word, `OR` works.
-pub fn build_query(input: &str) -> String {
+/// With `any`, one matching word is enough; bm25 still ranks mails with more
+/// matches first.
+pub fn build_query(input: &str, any: bool) -> String {
     let mut terms: Vec<String> = Vec::new();
     let mut chars = input.chars().peekable();
     let mut cur = String::new();
@@ -347,6 +347,15 @@ pub fn build_query(input: &str) -> String {
     if terms.first().is_some_and(|t| t.starts_with("NOT ")) {
         return String::new();
     }
+    if any && !terms.iter().any(|t| t == "OR" || t == "AND") {
+        let (neg, pos): (Vec<String>, Vec<String>) = terms.into_iter().partition(|t| t.starts_with("NOT "));
+        let mut q = format!("({})", pos.join(" OR "));
+        for n in neg {
+            q.push(' ');
+            q.push_str(&n);
+        }
+        return q;
+    }
     terms.join(" ")
 }
 
@@ -356,13 +365,15 @@ mod tests {
 
     #[test]
     fn queries() {
-        assert_eq!(build_query("rechnung"), "\"rechnung\"*");
-        assert_eq!(build_query("0664 123-45"), "\"0664\"* \"123 45\"*");
-        assert_eq!(build_query("\"beta platz\" oeffigo"), "\"beta platz\" \"oeffigo\"*");
-        assert_eq!(build_query("a OR b"), "\"a\"* OR \"b\"*");
-        assert_eq!(build_query("github -dependabot"), "\"github\"* NOT \"dependabot\"*");
-        assert_eq!(build_query("\"); DROP"), "\"DROP\"");
-        assert_eq!(build_query("-only"), "");
-        assert_eq!(build_query("  "), "");
+        assert_eq!(build_query("rechnung", false), "\"rechnung\"*");
+        assert_eq!(build_query("0664 123-45", false), "\"0664\"* \"123 45\"*");
+        assert_eq!(build_query("\"beta platz\" oeffigo", false), "\"beta platz\" \"oeffigo\"*");
+        assert_eq!(build_query("a OR b", false), "\"a\"* OR \"b\"*");
+        assert_eq!(build_query("github -dependabot", false), "\"github\"* NOT \"dependabot\"*");
+        assert_eq!(build_query("\"); DROP", false), "\"DROP\"");
+        assert_eq!(build_query("-only", false), "");
+        assert_eq!(build_query("  ", false), "");
+        assert_eq!(build_query("rechnung zahlen -spam", true), "(\"rechnung\"* OR \"zahlen\"*) NOT \"spam\"*");
+        assert_eq!(build_query("a OR b", true), "\"a\"* OR \"b\"*");
     }
 }

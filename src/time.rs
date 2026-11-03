@@ -48,11 +48,10 @@ pub fn parse_when(s: &str) -> Result<i64> {
         return Ok(d.timestamp());
     }
     for f in ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"] {
-        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(s, f) {
-            if let Some(t) = Local.from_local_datetime(&d).single() {
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(s, f)
+            && let Some(t) = Local.from_local_datetime(&d).single() {
                 return Ok(t.timestamp());
             }
-        }
     }
     for f in ["%Y-%m-%d", "%d.%m.%Y"] {
         if let Ok(d) = NaiveDate::parse_from_str(s, f) {

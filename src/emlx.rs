@@ -233,12 +233,11 @@ pub fn attachments(emlx: &Emlx, msg: &Message<'_>) -> Vec<AttachmentInfo> {
             .unwrap_or_default();
         let mut size = part.decoded_len();
         let mut on_disk_only = false;
-        if emlx.partial && size == 0 && !name.is_empty() {
-            if let Some(p) = partial_attachment_path(emlx, &name) {
+        if emlx.partial && size == 0 && !name.is_empty()
+            && let Some(p) = partial_attachment_path(emlx, &name) {
                 size = std::fs::metadata(&p).map(|m| m.len() as usize).unwrap_or(0);
                 on_disk_only = true;
             }
-        }
         out.push(AttachmentInfo { index, name, mime, size, on_disk_only });
     }
     out

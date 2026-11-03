@@ -89,15 +89,69 @@ impl Server {
         tokio::spawn(async move {
             me.addresses().await;
         });
+        let me = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = me.live_index().await {
+                eprintln!("mailidx: live index off: {e:#}");
+            }
+        });
+    }
+
+    /// Keeps the full-text index in step with Mail. FSEvents reports every write
+    /// to Mail's Envelope Index (and its WAL); after a quiet second the index syncs
+    /// in the background, so searches never pay for indexing new mail.
+    async fn live_index(&self) -> Result<()> {
+        use notify::{RecursiveMode, Watcher};
+        let dir = {
+            let store = self.inner.store.lock().map_err(|_| anyhow!("store lock poisoned"))?;
+            store.mail_root.join("MailData")
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut watcher = notify::recommended_watcher(move |ev: notify::Result<notify::Event>| {
+            if let Ok(ev) = ev
+                && ev.paths.iter().any(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("Envelope Index")))
+            {
+                let _ = tx.send(());
+            }
+        })?;
+        watcher.watch(&dir, RecursiveMode::NonRecursive)?;
+        self.sync_index().await;
+        while rx.recv().await.is_some() {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
+                    Ok(Some(())) => continue,
+                    Ok(None) => return Ok(()),
+                    Err(_) => break,
+                }
+            }
+            self.sync_index().await;
+        }
+        drop(watcher);
+        Ok(())
+    }
+
+    async fn sync_index(&self) {
+        let res = self
+            .with(|s, idx| {
+                let mut idx = idx.lock().map_err(|_| anyhow!("index lock poisoned"))?;
+                idx.sync(s)
+            })
+            .await;
+        match res {
+            Ok(st) if st.added + st.removed + st.upgraded > 0 => {
+                eprintln!("mailidx: index +{} -{} ~{} in {} ms", st.added, st.removed, st.upgraded, st.ms)
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("mailidx: background sync failed: {e:#}"),
+        }
     }
 
     async fn addresses(&self) -> Vec<(String, Vec<String>)> {
         let mut guard = self.inner.my_addresses.lock().await;
-        if guard.is_none() {
-            if let Ok(a) = script::account_addresses().await {
+        if guard.is_none()
+            && let Ok(a) = script::account_addresses().await {
                 *guard = Some(a);
             }
-        }
         guard.clone().unwrap_or_default()
     }
 
@@ -204,6 +258,11 @@ pub struct SearchArgs {
     pub include_trash: bool,
     /// "relevance" (default when query is set) or "date".
     pub sort: Option<String>,
+    /// true: a message matches if any word matches (ranked by how many do).
+    /// Default false: all words must match; if that finds nothing, any-word
+    /// matching is tried automatically and the result says "matched": "any".
+    #[serde(default)]
+    pub match_any: bool,
     /// Pass query to SQLite FTS5 unchanged (advanced: NEAR, column filters like subject:foo).
     #[serde(default)]
     pub raw_query: bool,
@@ -448,11 +507,10 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 }
 
 fn expand_home(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(h) = std::env::var("HOME") {
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Ok(h) = std::env::var("HOME") {
             return PathBuf::from(h).join(rest);
         }
-    }
     PathBuf::from(p)
 }
 
@@ -604,7 +662,12 @@ impl Server {
                 };
                 let mut idx = index.lock().map_err(|_| anyhow!("index lock poisoned"))?;
                 idx.sync(s)?;
-                let hits = idx.search(q, a.raw_query, 20_000)?;
+                let mut matched = if a.match_any { "any" } else { "all" };
+                let mut hits = idx.search(q, a.raw_query, a.match_any, 20_000)?;
+                if hits.is_empty() && !a.match_any && !a.raw_query && q.split_whitespace().count() > 1 {
+                    hits = idx.search(q, false, true, 20_000)?;
+                    matched = "any";
+                }
                 drop(idx);
                 let rank: HashMap<i64, usize> =
                     hits.iter().enumerate().map(|(i, h)| (h.id, i)).collect();
@@ -625,7 +688,7 @@ impl Server {
                         r.preview = None;
                     }
                 }
-                Ok(json!({ "total": total, "results": page }))
+                Ok(json!({ "total": total, "matched": matched, "results": page }))
             })
             .await
         );
@@ -666,7 +729,7 @@ impl Server {
                         let hs: Vec<(String, String)> = m
                             .headers()
                             .iter()
-                            .map(|h| (h.name().as_str().to_string(), String::from_utf8_lossy(h.raw_value().as_ref()).trim().to_string()))
+                            .map(|h| (h.name().as_str().to_string(), String::from_utf8_lossy(h.raw_value()).trim().to_string()))
                             .collect();
                         v["headers"] = json!(hs);
                     }
@@ -722,11 +785,10 @@ impl Server {
                         Ok((mid, t)) => (mid, t),
                         Err(_) => (None, r.preview.clone().unwrap_or_default()),
                     };
-                    if let Some(m) = &mid {
-                        if !seen.insert(m.clone()) {
+                    if let Some(m) = &mid
+                        && !seen.insert(m.clone()) {
                             continue;
                         }
-                    }
                     let mut v = serde_json::to_value(&r)?;
                     v["body"] = json!(truncate_chars(&text, a.max_chars_per_message));
                     if let Some(o) = v.as_object_mut() {
@@ -835,7 +897,7 @@ impl Server {
                 } else if let Some(q) = a.query.as_deref() {
                     let mut idx = index.lock().map_err(|_| anyhow!("index lock poisoned"))?;
                     idx.sync(s)?;
-                    f.ids = Some(idx.search(q, false, a.limit)?.into_iter().map(|h| h.id).collect());
+                    f.ids = Some(idx.search(q, false, false, a.limit)?.into_iter().map(|h| h.id).collect());
                 } else if f.mailbox_ids.is_none() && f.since.is_none() {
                     bail!("give ids, query, mailbox or since");
                 }
@@ -849,7 +911,7 @@ impl Server {
                     let e = emlx::read(&path)?;
                     let base = emlx::sanitize_filename(&format!(
                         "{} {}",
-                        &r.date.get(..10).unwrap_or(""),
+                        r.date.get(..10).unwrap_or(""),
                         truncate_chars(&r.subject, 60).trim_end_matches('…')
                     ));
                     match format.as_str() {
