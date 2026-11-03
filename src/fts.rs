@@ -56,6 +56,9 @@ pub fn index_path() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("MAILIDX_INDEX") {
         return Ok(PathBuf::from(p));
     }
+    if let Some(p) = crate::config::Config::load_or_default().index_path {
+        return Ok(PathBuf::from(p));
+    }
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home).join("Library/Caches/mailidx/index.sqlite"))
 }

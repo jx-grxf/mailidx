@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -13,10 +14,12 @@ use serde_json::json;
 
 use crate::emlx;
 use crate::fts::Index;
+use crate::config::Config;
 use crate::script::{self, Kind, MsgRef, Outgoing};
 use crate::signature::Signatures;
 use crate::store::{Filter, MessageRow, Role, Store, category_id, format_addr, truncate_chars};
 use crate::time::{fmt_ts, now, parse_when};
+use crate::update;
 
 type ToolResult = std::result::Result<CallToolResult, ErrorData>;
 
@@ -25,6 +28,9 @@ struct Inner {
     index: Mutex<Index>,
     last_refresh: Mutex<Instant>,
     my_addresses: tokio::sync::Mutex<Option<Vec<(String, Vec<String>)>>>,
+    config: Config,
+    update: Mutex<Option<update::Status>>,
+    update_noticed: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -59,6 +65,9 @@ impl Server {
                 index: Mutex::new(index),
                 last_refresh: Mutex::new(Instant::now()),
                 my_addresses: tokio::sync::Mutex::new(None),
+                config: Config::load_or_default(),
+                update: Mutex::new(update::cached()),
+                update_noticed: AtomicBool::new(false),
             }),
             tool_router: Self::tool_router(),
         }
@@ -90,6 +99,17 @@ impl Server {
         tokio::spawn(async move {
             me.addresses().await;
         });
+        if self.inner.config.update_check {
+            let inner = self.inner.clone();
+            tokio::task::spawn_blocking(move || match update::check(false) {
+                Ok(s) => {
+                    if let Ok(mut u) = inner.update.lock() {
+                        *u = Some(s);
+                    }
+                }
+                Err(e) => eprintln!("mailidx: update check failed: {e:#}"),
+            });
+        }
         let me = self.clone();
         tokio::spawn(async move {
             if let Err(e) = me.live_index().await {
@@ -1102,6 +1122,7 @@ impl Server {
         annotations(destructive_hint = false, open_world_hint = true)
     )]
     async fn compose(&self, Parameters(a): Parameters<ComposeArgs>) -> ToolResult {
+        tri!(self.may_send(a.send));
         if a.to.is_empty() && a.cc.is_empty() && a.bcc.is_empty() {
             return fail(anyhow!("no recipients"));
         }
@@ -1127,6 +1148,7 @@ impl Server {
         annotations(destructive_hint = false, open_world_hint = true)
     )]
     async fn reply(&self, Parameters(a): Parameters<ReplyArgs>) -> ToolResult {
+        tri!(self.may_send(a.send));
         let (r, row) = tri!(self.msg_ref(a.id).await);
         let attachments = tri!(check_attachments(&a.attachments));
         let o = Outgoing {
@@ -1151,6 +1173,7 @@ impl Server {
         annotations(destructive_hint = false, open_world_hint = true)
     )]
     async fn forward(&self, Parameters(a): Parameters<ForwardArgs>) -> ToolResult {
+        tri!(self.may_send(a.send));
         if a.to.is_empty() {
             return fail(anyhow!("no recipients"));
         }
@@ -1279,6 +1302,7 @@ impl Server {
                 ok(&json!({ "trashed": id }))
             }
             "send" => {
+                tri!(self.may_send(true));
                 let Some(id) = a.id else { return fail(anyhow!("send needs an id")) };
                 let tmp = std::env::temp_dir().join(format!("mailidx-draft-{id}"));
                 let t2 = tmp.clone();
@@ -1372,9 +1396,70 @@ impl Server {
         tri!(script::open_in_mail(&r).await);
         ok(&json!({ "opened": a.id }))
     }
+
+    #[tool(
+        description = "Check GitHub for a newer mailidx release; install=true downloads it, verifies its checksum and replaces this binary. Install only when the user agreed. Afterwards the MCP client must reconnect mailidx.",
+        annotations(destructive_hint = true, open_world_hint = true)
+    )]
+    async fn update(&self, Parameters(a): Parameters<UpdateToolArgs>) -> ToolResult {
+        let status = tri!(tokio::task::spawn_blocking(|| update::check(true)).await.map_err(anyhow::Error::from)
+            .and_then(|r| r));
+        if let Ok(mut u) = self.inner.update.lock() {
+            *u = Some(status.clone());
+        }
+        self.inner.update_noticed.store(true, Ordering::Relaxed);
+        if !a.install || !status.available {
+            return ok(&status);
+        }
+        let version = status.latest.clone();
+        let path = tri!(
+            tokio::task::spawn_blocking(move || update::install(&version))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r)
+        );
+        ok(&json!({
+            "installed": status.latest,
+            "previous": status.current,
+            "path": path.display().to_string(),
+            "next_step": "This server still runs the old version. Ask the user to reconnect mailidx (Claude Code: /mcp → mail → Reconnect).",
+        }))
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateToolArgs {
+    /// false (default): only check. true: install the newer release.
+    #[serde(default)]
+    pub install: bool,
 }
 
 impl Server {
+    fn may_send(&self, send: bool) -> Result<()> {
+        if send && self.inner.config.send_locked {
+            bail!(
+                "sending is locked in mailidx settings (send_locked = true); save a draft instead, \
+                 or the user can run `mailidx config set send_locked false`"
+            );
+        }
+        Ok(())
+    }
+
+    /// Text added once per session to the first successful tool result after a
+    /// newer release is known, so the agent can tell the user.
+    fn update_notice(&self) -> Option<String> {
+        let u = self.inner.update.lock().ok()?.clone()?;
+        if !u.available || self.inner.update_noticed.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        Some(format!(
+            "mailidx update: version {} is available (running {}). Tell the user once. \
+             They can run `mailidx update` in a terminal, or you can call the update tool if they agree. \
+             The MCP client has to reconnect mailidx afterwards. Release notes: {}",
+            u.latest, u.current, u.release_url
+        ))
+    }
+
     /// Old id → new id for each moved message, as far as Mail has indexed it within ~3 s.
     async fn find_moved(&self, mailbox_id: i64, globals: Vec<(i64, i64)>) -> HashMap<String, i64> {
         let mut found = HashMap::new();
@@ -1518,7 +1603,9 @@ fn awaiting_reply(s: &Store, me: &HashSet<String>, since: i64, limit: usize) -> 
 const INSTRUCTIONS: &str = "mailidx reads Apple Mail's own index and message files directly, so every read tool is instant and Mail.app does not need to do anything. \
 Start with overview or search. Message ids work in every tool; moving a message gives it a new id, which update_messages returns as new_ids. \
 Writing tools (compose, reply, forward, update_messages, drafts, create_mailbox, check_mail) go through Mail via AppleScript; compose/reply/forward save drafts unless send=true. \
-Only set send=true when the user clearly asked to send. Permanent deletion is not available; trash moves to the account's trash.";
+Only set send=true when the user clearly asked to send. Permanent deletion is not available; trash moves to the account's trash. \
+If a tool result contains a line starting with 'mailidx update:', tell the user that a new mailidx version is available and offer the update tool; do not install it without their agreement. \
+The user's settings may lock sending (drafts only) or hide accounts and mailboxes; hidden mail does not exist for any tool.";
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Server {
@@ -1529,5 +1616,21 @@ impl ServerHandler for Server {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(info)
             .with_instructions(INSTRUCTIONS)
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<rmcp::model::CallToolResponse, ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let mut res = self.tool_router.call(tcc).await?;
+        if let rmcp::model::CallToolResponse::Complete(r) = &mut res
+            && r.is_error != Some(true)
+            && let Some(note) = self.update_notice()
+        {
+            r.content.push(ContentBlock::text(note));
+        }
+        Ok(res)
     }
 }

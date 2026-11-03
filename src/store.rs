@@ -7,6 +7,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter, types
 use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::config::Config;
 use crate::time::fmt_ts;
 
 const FLAG_ANSWERED: i64 = 1 << 2;
@@ -163,6 +164,8 @@ pub struct Store {
     mailboxes: Vec<Mailbox>,
     mailbox_dirs: HashMap<i64, Option<PathBuf>>,
     account_names: HashMap<String, String>,
+    config: Config,
+    hidden: Vec<i64>,
 }
 
 pub fn find_mail_root() -> Result<PathBuf> {
@@ -236,6 +239,8 @@ impl Store {
             mailboxes: Vec::new(),
             mailbox_dirs: HashMap::new(),
             account_names: load_account_names(),
+            config: Config::load_or_default(),
+            hidden: Vec::new(),
         };
         store.refresh_mailboxes()?;
         Ok(store)
@@ -286,8 +291,15 @@ impl Store {
             });
         }
         out.sort_by(|a, b| a.account.cmp(&b.account).then(a.path.cmp(&b.path)));
-        self.mailboxes = out;
+        let (hidden, visible): (Vec<_>, Vec<_>) =
+            out.into_iter().partition(|m| self.config.hides_mailbox(&m.account, &m.path));
+        self.hidden = hidden.iter().map(|m| m.id).collect();
+        self.mailboxes = visible;
         Ok(())
+    }
+
+    pub fn hidden_mailbox_count(&self) -> usize {
+        self.hidden.len()
     }
 
     pub fn mailboxes(&self) -> &[Mailbox] {
@@ -414,6 +426,9 @@ impl Store {
         }
         if !f.exclude_mailbox_ids.is_empty() {
             in_list(&mut sql, "m.mailbox", &f.exclude_mailbox_ids, true);
+        }
+        if !self.hidden.is_empty() {
+            in_list(&mut sql, "m.mailbox", &self.hidden, true);
         }
         if let Some(from) = &f.from {
             sql.push_str(" AND (a.address LIKE ? OR a.comment LIKE ?)");
@@ -635,8 +650,15 @@ impl Store {
         let mut st = self
             .conn
             .prepare_cached("SELECT ROWID, mailbox FROM messages WHERE deleted = 0")?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, mb) = row?;
+            if !self.hidden.contains(&mb) {
+                out.push((id, mb));
+            }
+        }
+        Ok(out)
     }
 
     pub fn fingerprint(&self) -> Result<(i64, i64)> {

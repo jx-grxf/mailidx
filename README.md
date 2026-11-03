@@ -9,7 +9,7 @@ An Apple Mail MCP server for macOS. It lets Claude, Codex or any other MCP clien
 ![Rust](https://img.shields.io/badge/rust-2024-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-[Install](#install) · [Tools](#tools) · [Benchmark](#benchmark) · [How it works](#how-it-works)
+[Install](#install) · [Settings](#settings) · [Tools](#tools) · [Benchmark](#benchmark) · [How it works](#how-it-works)
 
 </div>
 
@@ -35,7 +35,7 @@ An Apple Mail MCP server for macOS. It lets Claude, Codex or any other MCP clien
 - Mark read or unread, flag with a color, move, junk, trash, create mailboxes, send or discard drafts, fetch new mail.
 - There is no permanent delete. Trash only.
 
-Nothing leaves the Mac. mailidx makes no network requests.
+Your mail never leaves the Mac. The only network request is a check for a new mailidx release on GitHub, at most once a day, and you can turn it off.
 
 ## Install
 
@@ -68,6 +68,26 @@ Any other MCP client: run `~/.local/bin/mailidx` as a stdio server with no argum
 3. Register the server with the client you run in, using the absolute path to the binary.
 4. Call the `overview` tool to confirm it works.
 
+## Settings
+
+Settings live in `~/.config/mailidx/config.toml`. Change them with `mailidx config set <key> <value>` and reconnect the server in your MCP client.
+
+| Key | Default | What it does |
+|---|---|---|
+| `send_locked` | `false` | Tools can only save drafts. `send: true` and `drafts send` are refused. |
+| `hidden_accounts` | none | Account names no tool can see, comma-separated. |
+| `hidden_mailboxes` | none | Mailbox paths such as `Privat` or `iCloud/Business/Clients`, including their subfolders. Hidden mail is not indexed and cannot be opened by id. |
+| `update_check` | `true` | Ask GitHub at most once a day whether a newer release exists. |
+| `index_path` | `~/Library/Caches/mailidx/index.sqlite` | Where the search index lives. |
+
+`mailidx status` shows the version, update state, mail and index counts and the current settings in one view.
+
+## Updates
+
+`mailidx update` downloads the latest release, checks it against the published SHA-256 checksum, makes sure it starts and replaces the binary in place. `mailidx update --check` only looks.
+
+When a newer release exists, the first tool result of a session carries a short note, so the agent can tell you. The `update` tool installs it from inside the MCP client if you agree. In both cases the client has to reconnect mailidx afterwards.
+
 ## Tools
 
 | Tool | What it does |
@@ -83,6 +103,7 @@ Any other MCP client: run `~/.local/bin/mailidx` as a stdio server with no argum
 | `update_messages` | Read, unread, flag, flag color, move, trash, junk |
 | `drafts` | List, send or trash drafts |
 | `create_mailbox`, `check_mail`, `open_in_mail` | New folder, fetch mail, show a message in Mail |
+| `update` | Check for a newer mailidx release and install it |
 
 ## Benchmark
 
@@ -108,11 +129,14 @@ Rebuilding the whole search index for those messages takes well under a second.
 ## Command line
 
 ```
-mailidx                  run the MCP server on stdio
-mailidx index            update the search index and print stats
-mailidx index --rebuild  rebuild it from scratch
-mailidx search <query>   search from the terminal (JSON lines)
-mailidx doctor           check permissions and paths
+mailidx                    run the MCP server on stdio
+mailidx status [--json]    version, update, mail and index state, settings
+mailidx update [--check]   install the latest release, or only look
+mailidx config             show settings; also get, set, unset, path
+mailidx index              update the search index and print stats
+mailidx index --rebuild    rebuild it from scratch
+mailidx search <query>     search from the terminal (JSON lines)
+mailidx doctor             check permissions and paths
 ```
 
 ## Development

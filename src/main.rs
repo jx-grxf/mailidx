@@ -1,3 +1,5 @@
+mod cli;
+mod config;
 mod emlx;
 mod fts;
 mod script;
@@ -5,6 +7,7 @@ mod signature;
 mod store;
 mod time;
 mod tools;
+mod update;
 
 use std::time::Instant;
 
@@ -18,6 +21,9 @@ Usage:
   mailidx index           update the full-text index and print stats
   mailidx index --rebuild rebuild the index from scratch
   mailidx search <query>  search from the terminal (JSON lines)
+  mailidx status [--json] version, update, Mail and index state, settings
+  mailidx update [--check] install the latest release (--check only looks)
+  mailidx config          show settings; also: get <key>, set <key> <value>, unset <key>, path
   mailidx doctor          check permissions and paths
   mailidx --version
 ";
@@ -30,6 +36,9 @@ async fn main() -> Result<()> {
         Some("index") => index(args.iter().any(|a| a == "--rebuild")),
         Some("search") => search(&args[1..].join(" ")),
         Some("doctor") => doctor().await,
+        Some("status") => cli::status(args.iter().any(|a| a == "--json")),
+        Some("update") => cli::update(args.iter().any(|a| a == "--check")),
+        Some("config") => cli::config(&args[1..]),
         Some("-V" | "--version" | "version") => {
             println!("mailidx {}", env!("CARGO_PKG_VERSION"));
             Ok(())
