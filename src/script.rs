@@ -274,22 +274,75 @@ on fill(m, sndr, toL, ccL, bccL, atts)
     end tell
 end fill
 
-on pasteIntoMail()
-    tell application "Mail" to activate
+on findWebArea(el, depth)
     tell application "System Events"
+        repeat with c in (UI elements of el)
+            if role of c is "AXWebArea" then return contents of c
+        end repeat
+        if depth < 3 then
+            repeat with c in (UI elements of el)
+                if role of c is in {"AXScrollArea", "AXGroup", "AXSplitGroup"} then
+                    set found to my findWebArea(c, depth + 1)
+                    if found is not missing value then return found
+                end if
+            end repeat
+        end if
+    end tell
+    return missing value
+end findWebArea
+
+on pasteIntoMail(subj)
+    tell application "Mail" to activate
+    tell application "System Events" to tell process "Mail"
+        set cw to missing value
         repeat 50 times
-            if frontmost of process "Mail" then exit repeat
             try
-                set frontmost of process "Mail" to true
+                set frontmost to true
+                set cw to (first window whose name is subj)
+                perform action "AXRaise" of cw
+                if value of attribute "AXMain" of cw is true then exit repeat
             end try
             delay 0.1
         end repeat
-        if not (frontmost of process "Mail") then error "Mail did not come to the front; nothing was pasted"
-        delay 0.8
-        keystroke "v" using command down
+        if cw is missing value then error "compose window not visible to Accessibility"
+        if value of attribute "AXMain" of cw is not true then error "compose window did not become Mail's main window; nothing was pasted"
+        -- Mail focuses the To field when recipients are set; the paste must land in the body.
+        set webArea to my findWebArea(cw, 0)
+        if webArea is missing value then error "message body not found in the compose window"
+        set value of attribute "AXFocused" of webArea to true
+        delay 0.3
+        -- Edit is the 4th menu (Apple, Mail, File, Edit) in every language; Paste is the item bound to plain Cmd+V.
+        set pasteItem to missing value
+        repeat with mi in (menu items of menu 1 of menu bar item 4 of menu bar 1)
+            try
+                if (value of attribute "AXMenuItemCmdChar" of mi) is "V" and (value of attribute "AXMenuItemCmdModifiers" of mi) is 0 then
+                    set pasteItem to contents of mi
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if pasteItem is missing value then error "Mail's Paste menu item was not found"
+        if not (enabled of pasteItem) then error "Mail's Paste menu item is disabled; nothing was pasted"
+        perform action "AXPress" of pasteItem
     end tell
     delay 1.0
 end pasteIntoMail
+
+on closeAsDraft(subj)
+    tell application "System Events" to tell process "Mail"
+        set cw to (first window whose name is subj)
+        perform action "AXPress" of (value of attribute "AXCloseButton" of cw)
+        repeat 50 times
+            if (count of sheets of cw) > 0 then exit repeat
+            if not (exists (first window whose name is subj)) then return
+            delay 0.1
+        end repeat
+        if (count of sheets of cw) = 0 then error "compose window did not close"
+        -- The default button of "Save this message as a draft?" is Save, in every language.
+        perform action "AXPress" of (value of attribute "AXDefaultButton" of sheet 1 of cw)
+    end tell
+    delay 0.5
+end closeAsDraft
 
 on composeWindow(subj)
     tell application "Mail"
@@ -326,17 +379,17 @@ const GUI_BODY: &str = r#"
         my fill(m, item 8 of argv, item 9 of argv, item 10 of argv, item 11 of argv, item 12 of argv)
         tell application "Mail" to set subj to subject of m
         set w to my composeWindow(subj)
-        my pasteIntoMail()
+        my pasteIntoMail(subj)
         my restorePB(pb, saved)
         tell application "Mail"
             if (item 13 of argv) is "true" then
                 send m
                 set res to "sent"
             else
-                close w saving yes
                 set res to "draft"
             end if
         end tell
+        if res is "draft" then my closeAsDraft(subj)
         return res & linefeed & subj
     on error e
         my restorePB(pb, saved)
