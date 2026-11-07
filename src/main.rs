@@ -1,7 +1,9 @@
 mod cli;
 mod config;
 mod emlx;
+mod extract;
 mod fts;
+mod ical;
 mod script;
 mod signature;
 mod store;
@@ -55,8 +57,8 @@ async fn main() -> Result<()> {
 }
 
 async fn serve() -> Result<()> {
-    let store = store::Store::open()?;
     let index = fts::Index::open()?;
+    let store = store::Store::open()?;
     let server = tools::Server::new(store, index);
     server.warm_up();
     let service = server.serve(rmcp::transport::stdio()).await?;
@@ -65,8 +67,8 @@ async fn serve() -> Result<()> {
 }
 
 fn index(rebuild: bool) -> Result<()> {
-    let mut store = store::Store::open()?;
     let mut idx = fts::Index::open()?;
+    let mut store = store::Store::open()?;
     let stats = if rebuild { idx.rebuild(&mut store)? } else { idx.sync(&mut store)? };
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "sync": stats, "index": idx.status()? }))?);
     Ok(())
@@ -74,8 +76,8 @@ fn index(rebuild: bool) -> Result<()> {
 
 fn search(q: &str) -> Result<()> {
     let t0 = Instant::now();
-    let mut store = store::Store::open()?;
     let mut idx = fts::Index::open()?;
+    let mut store = store::Store::open()?;
     idx.sync(&mut store)?;
     let hits = idx.search(q, false, false, 50)?;
     let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();

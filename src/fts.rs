@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::emlx;
 use crate::store::Store;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
 const INCOMPLETE_RECHECK_SECS: u64 = 60;
 
 pub struct Index {
@@ -50,6 +50,9 @@ struct Doc {
     recipients: String,
     body: String,
     attachments: String,
+    inline: i64,
+    unsubscribe: Option<emlx::Unsubscribe>,
+    invite: bool,
 }
 
 pub fn index_path() -> Result<PathBuf> {
@@ -83,7 +86,11 @@ impl Index {
             )?;
         }
         conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS doc (id INTEGER PRIMARY KEY, complete INTEGER NOT NULL);
+            "CREATE TABLE IF NOT EXISTS doc (
+                 id INTEGER PRIMARY KEY, complete INTEGER NOT NULL, inline INTEGER NOT NULL DEFAULT 0,
+                 unsub_url TEXT, unsub_mailto TEXT, unsub_one_click INTEGER NOT NULL DEFAULT 0,
+                 invite INTEGER NOT NULL DEFAULT 0
+             );
              CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
                  subject, sender, recipients, body, attachments,
                  tokenize = 'unicode61 remove_diacritics 2',
@@ -158,7 +165,10 @@ impl Index {
                 del_fts.execute([id])?;
             }
             let mut ins_doc =
-                tx.prepare_cached("INSERT OR REPLACE INTO doc (id, complete) VALUES (?, ?)")?;
+                tx.prepare_cached(
+                "INSERT OR REPLACE INTO doc (id, complete, inline, unsub_url, unsub_mailto, unsub_one_click, invite)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )?;
             let mut ins_fts = tx.prepare_cached(
                 "INSERT INTO fts (rowid, subject, sender, recipients, body, attachments) VALUES (?,?,?,?,?,?)",
             )?;
@@ -175,7 +185,16 @@ impl Index {
                 if !d.complete {
                     stats.without_file += 1;
                 }
-                ins_doc.execute(params![d.id, d.complete as i64])?;
+                let u = d.unsubscribe.as_ref();
+                ins_doc.execute(params![
+                    d.id,
+                    d.complete as i64,
+                    d.inline,
+                    u.and_then(|u| u.url.as_deref()),
+                    u.and_then(|u| u.mailto.as_deref()),
+                    u.is_some_and(|u| u.one_click) as i64,
+                    d.invite as i64
+                ])?;
                 ins_fts.execute(params![
                     d.id, d.subject, d.sender, d.recipients, d.body, d.attachments
                 ])?;
@@ -263,6 +282,7 @@ fn build_doc(id: i64, path: Option<PathBuf>, fallback: Option<String>) -> Doc {
                 recipients.extend(emlx::addresses(msg.cc()));
                 let names: Vec<String> =
                     msg.attachments().filter_map(|a| a.attachment_name().map(String::from)).collect();
+                let inline = emlx::attachments(&e, &msg).iter().filter(|a| a.inline).count() as i64;
                 return Doc {
                     id,
                     complete: true,
@@ -271,6 +291,9 @@ fn build_doc(id: i64, path: Option<PathBuf>, fallback: Option<String>) -> Doc {
                     recipients: recipients.join(", "),
                     body: emlx::body_text(&msg),
                     attachments: names.join(" "),
+                    inline,
+                    unsubscribe: emlx::unsubscribe(&msg),
+                    invite: !crate::ical::invites(&msg).is_empty(),
                 };
             }
     let fb = fallback.unwrap_or_default();
@@ -283,6 +306,9 @@ fn build_doc(id: i64, path: Option<PathBuf>, fallback: Option<String>) -> Doc {
         recipients: String::new(),
         body: it.next().unwrap_or("").to_string(),
         attachments: String::new(),
+        inline: 0,
+        unsubscribe: None,
+        invite: false,
     }
 }
 

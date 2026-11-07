@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::emlx;
+use crate::extract;
+use crate::ical;
 use crate::fts::Index;
 use crate::config::Config;
 use crate::script::{self, Kind, MsgRef, Outgoing};
@@ -238,6 +240,8 @@ pub struct ListArgs {
     pub category: Option<String>,
     /// Only messages Mail marked as important (high impact).
     pub important: Option<bool>,
+    /// Only messages with (true) or without (false) a calendar invitation.
+    pub has_invite: Option<bool>,
     /// Lower bound on date received: "2026-11-01", "2026-11-01 08:00", "today", or relative "7d", "12h", "2w".
     pub since: Option<String>,
     /// Upper bound on date received (exclusive), same formats as since.
@@ -274,6 +278,8 @@ pub struct SearchArgs {
     pub category: Option<String>,
     /// Only messages Mail marked as important (high impact).
     pub important: Option<bool>,
+    /// Only messages with (true) or without (false) a calendar invitation.
+    pub has_invite: Option<bool>,
     /// Also search trash and junk (excluded by default unless mailbox says otherwise).
     #[serde(default)]
     pub include_trash: bool,
@@ -294,6 +300,73 @@ pub struct SearchArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct WaitArgs {
+    /// Full-text query, same syntax as search (all words must match).
+    pub query: Option<String>,
+    /// Sender name or address contains this text.
+    pub from: Option<String>,
+    /// A recipient (to/cc) name or address contains this text.
+    pub to: Option<String>,
+    /// Subject contains this text.
+    pub subject: Option<String>,
+    /// Limit to a mailbox (role, folder path or id). Default: every incoming mailbox, junk and trash included.
+    pub mailbox: Option<String>,
+    pub account: Option<String>,
+    /// Also accept messages that were already there, if received at or after this time ("10m", "2026-11-07 14:00"). Pass the time you triggered the mail, so one that arrived before this call still counts.
+    pub since: Option<String>,
+    /// Give up after this many seconds (max 600).
+    #[serde(default = "default_wait")]
+    pub timeout_seconds: u64,
+    /// Ask Mail to fetch new mail first (check_mail). Without it, Mail's own fetch interval decides.
+    #[serde(default = "default_true")]
+    pub fetch: bool,
+    #[serde(default = "default_wait_limit")]
+    pub limit: usize,
+    /// Add one-time codes and confirm/verify/login/review links to each result.
+    #[serde(default)]
+    pub extract: bool,
+}
+fn default_wait() -> u64 {
+    60
+}
+fn default_wait_limit() -> usize {
+    10
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UnsubArgs {
+    /// "list" (default): newsletters and mailing lists you receive, grouped by sender, with their unsubscribe options.
+    /// "unsubscribe": unsubscribe from the sender of message id (or from sender). Only when the user asked for it.
+    pub action: Option<String>,
+    /// A message from the list to leave (for action unsubscribe).
+    pub id: Option<i64>,
+    /// Sender address (for action unsubscribe), alternative to id.
+    pub sender: Option<String>,
+    /// Look at mail received since then (default 180d).
+    pub since: Option<String>,
+    pub account: Option<String>,
+    #[serde(default = "default_unsub_limit")]
+    pub limit: usize,
+}
+fn default_unsub_limit() -> usize {
+    40
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ContactArgs {
+    /// Name or address fragment ("anna", "@htl"). Empty: your most frequent contacts.
+    pub query: Option<String>,
+    /// Include newsletters and no-reply senders.
+    #[serde(default)]
+    pub include_automated: bool,
+    #[serde(default = "default_contact_limit")]
+    pub limit: usize,
+}
+fn default_contact_limit() -> usize {
+    20
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct GetArgs {
     /// Message id from list_messages or search.
     pub id: i64,
@@ -308,6 +381,9 @@ pub struct GetArgs {
     /// Include all raw headers.
     #[serde(default)]
     pub all_headers: bool,
+    /// Pull out one-time codes and confirm/verify/login/review links (sign-up and form tests).
+    #[serde(default)]
+    pub extract: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -450,7 +526,15 @@ pub struct ForwardArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct UpdateArgs {
+    /// Message ids. Leave empty and pass filter to act on every match instead.
+    #[serde(default)]
     pub ids: Vec<i64>,
+    /// Select messages by filter instead of ids, e.g. everything from one newsletter.
+    pub filter: Option<BulkFilter>,
+    /// With filter: only report what would change (default true). Run once, show the user, then repeat with dry_run false.
+    pub dry_run: Option<bool>,
+    /// With filter: refuse when more messages match (default 200, at most 2000).
+    pub max: Option<usize>,
     /// One of: mark_read, mark_unread, flag, unflag, flag_color, move, trash, junk, not_junk.
     pub action: String,
     /// For move: target mailbox (role or path).
@@ -459,6 +543,25 @@ pub struct UpdateArgs {
     pub account: Option<String>,
     /// For flag_color: red, orange, yellow, green, blue, purple, gray.
     pub color: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct BulkFilter {
+    /// Full-text query, same syntax as search.
+    pub query: Option<String>,
+    /// Sender name or address contains this text.
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub subject: Option<String>,
+    /// Default: every mailbox except trash and junk.
+    pub mailbox: Option<String>,
+    pub account: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub unread: Option<bool>,
+    pub flagged: Option<bool>,
+    /// primary, transactions, updates, promotions.
+    pub category: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -474,6 +577,15 @@ pub struct MailboxArgs {
     /// Name of the new mailbox; use "Parent/Child" for nesting.
     pub name: String,
     pub account: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RenameMailboxArgs {
+    /// Mailbox to rename: folder path ("Projects/2026") or mailbox id. Inbox, sent, drafts, trash, junk and archive cannot be renamed.
+    pub mailbox: String,
+    pub account: Option<String>,
+    /// The folder's new own name; it stays under the same parent.
+    pub new_name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -510,6 +622,54 @@ fn parse_category(c: Option<&str>) -> Result<Option<i64>> {
             .map(Some)
             .ok_or_else(|| anyhow!("unknown category '{c}' (primary, transactions, updates, promotions)")),
     }
+}
+
+/// Lowercase without diacritics, so "muller" finds "Müller".
+fn fold(s: &str) -> String {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    s.nfd().filter(|c| !is_combining_mark(*c)).collect::<String>().to_lowercase()
+}
+
+fn parse_mailto(m: &str) -> (String, Option<String>, Option<String>) {
+    let rest = m.strip_prefix("mailto:").or_else(|| m.strip_prefix("MAILTO:")).unwrap_or(m);
+    let (to, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let decode = |s: &str| percent_encoding::percent_decode_str(&s.replace('+', " ")).decode_utf8_lossy().into_owned();
+    let mut subject = None;
+    let mut body = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            match k.to_ascii_lowercase().as_str() {
+                "subject" => subject = Some(decode(v)),
+                "body" => body = Some(decode(v)),
+                _ => {}
+            }
+        }
+    }
+    (decode(to), subject, body)
+}
+
+fn bulk_select(s: &mut Store, index: &Mutex<Index>, b: &BulkFilter) -> Result<Vec<MessageRow>> {
+    let mut f = base_filter(s, b.mailbox.as_deref(), b.account.as_deref(), b.since.as_deref(), b.until.as_deref())?;
+    if b.mailbox.is_none() {
+        f.exclude_mailbox_ids = s.role_ids(&[Role::Trash, Role::Junk]);
+    }
+    f.from = b.from.clone();
+    f.to = b.to.clone();
+    f.subject = b.subject.clone();
+    f.unread = b.unread;
+    f.flagged = b.flagged;
+    f.category = parse_category(b.category.as_deref())?;
+    if let Some(q) = b.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        let mut idx = index.lock().map_err(|_| anyhow!("index lock poisoned"))?;
+        idx.sync(s)?;
+        f.ids = Some(idx.search(q, false, false, 20_000)?.into_iter().map(|h| h.id).collect());
+    }
+    let unfiltered = b.query.is_none() && b.from.is_none() && b.to.is_none() && b.subject.is_none()
+        && b.mailbox.is_none() && b.since.is_none() && b.until.is_none() && b.category.is_none();
+    if unfiltered {
+        bail!("the filter selects all mail; add from, query, subject, mailbox, category or a date range");
+    }
+    s.list(&f)
 }
 
 fn unique_path(dir: &Path, name: &str) -> PathBuf {
@@ -634,6 +794,7 @@ impl Server {
                 f.flagged = a.flagged;
                 f.category = parse_category(a.category.as_deref())?;
                 f.important = a.important;
+                f.invite = a.has_invite;
                 f.limit = a.limit.clamp(1, 500);
                 f.offset = a.offset;
                 f.oldest_first = a.oldest_first;
@@ -673,6 +834,7 @@ impl Server {
                 f.has_attachments = a.has_attachments;
                 f.category = parse_category(a.category.as_deref())?;
                 f.important = a.important;
+                f.invite = a.has_invite;
                 let limit = a.limit.clamp(1, 500);
                 let query = a.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
                 let Some(q) = query else {
@@ -717,7 +879,90 @@ impl Server {
     }
 
     #[tool(
-        description = "Read one message: headers, recipients, body as text (or HTML), attachment list, optionally all links. Reads the .emlx file directly.",
+        description = "Wait until a new message matching the filters arrives, e.g. to check that a contact form or sign-up mail came through; extract=true also returns its one-time code and verify link. Only messages that arrive after the call count (or, with since, everything received since then). Incoming mail only: sent, outbox and drafts are skipped unless mailbox names them; junk and trash are included and each result names its mailbox, so mail filed as junk shows up as such. Asks Mail to fetch first unless fetch=false, then checks every 2 seconds until a match or timeout_seconds.",
+        annotations(read_only_hint = true)
+    )]
+    async fn wait_for(&self, Parameters(a): Parameters<WaitArgs>) -> ToolResult {
+        let start = Instant::now();
+        let deadline = start + std::time::Duration::from_secs(a.timeout_seconds.clamp(1, 600));
+        let since = tri!(a.since.as_deref().map(parse_when).transpose());
+        // Taken before fetching, so a message Mail stores during the fetch is already "new".
+        let baseline = tri!(self.with(|s, _| Ok(s.fingerprint()?.0)).await);
+        let fetch = a.fetch.then(|| {
+            let account = a.account.clone().unwrap_or_default();
+            tokio::spawn(async move { script::check_mail(&account).await })
+        });
+        let limit = a.limit.clamp(1, 100);
+        let args = Arc::new(a);
+        let rows = loop {
+            let args = args.clone();
+            let rows = tri!(
+                self.with(move |s, index| {
+                    let mut f = base_filter(s, args.mailbox.as_deref(), args.account.as_deref(), None, None)?;
+                    if args.mailbox.is_none() {
+                        f.exclude_mailbox_ids = s.role_ids(&[Role::Sent, Role::Outbox, Role::Drafts]);
+                    }
+                    match since {
+                        Some(t) => f.since = Some(t),
+                        None => f.after_id = Some(baseline),
+                    }
+                    f.from = args.from.clone();
+                    f.to = args.to.clone();
+                    f.subject = args.subject.clone();
+                    if let Some(q) = args.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                        let mut idx = index.lock().map_err(|_| anyhow!("index lock poisoned"))?;
+                        idx.sync(s)?;
+                        f.ids = Some(idx.search(q, false, false, 20_000)?.into_iter().map(|h| h.id).collect());
+                    }
+                    f.limit = limit;
+                    let rows = s.list(&f)?;
+                    let mut out = Vec::with_capacity(rows.len());
+                    for r in rows {
+                        let mut v = serde_json::to_value(&r)?;
+                        if args.extract {
+                            match load_parsed(s, r.id, |_, m| Ok(extract::from_message(m))) {
+                                Ok(found) => {
+                                    v["codes"] = json!(found.codes);
+                                    v["verify_links"] = json!(found.verify_links);
+                                }
+                                Err(e) => v["note"] = json!(format!("{e:#}")),
+                            }
+                        }
+                        out.push(v);
+                    }
+                    Ok(out)
+                })
+                .await
+            );
+            let now = Instant::now();
+            let body_pending = rows.iter().any(|r| r.get("note").is_some());
+            if (!rows.is_empty() && !body_pending) || now >= deadline {
+                break rows;
+            }
+            tokio::time::sleep((deadline - now).min(std::time::Duration::from_secs(2))).await;
+        };
+        let waited = (start.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+        let fetch_error = match fetch {
+            Some(h) if h.is_finished() => match h.await {
+                Ok(Err(e)) => Some(format!("{e:#}")),
+                Err(e) => Some(e.to_string()),
+                Ok(Ok(_)) => None,
+            },
+            _ => None,
+        };
+        if rows.is_empty() {
+            return ok(&json!({
+                "arrived": false,
+                "waited_seconds": waited,
+                "fetch_error": fetch_error,
+                "hint": "Nothing new matched. Mail may not have fetched it yet: call wait_for again, or loosen the filters. If the mail may have arrived before this call, pass since.",
+            }));
+        }
+        ok(&json!({ "arrived": true, "waited_seconds": waited, "fetch_error": fetch_error, "results": rows }))
+    }
+
+    #[tool(
+        description = "Read one message: headers, recipients, body as text (or HTML), attachments (inline images such as signature logos listed apart), calendar invitations, optionally all links and extracted one-time codes. Reads the .emlx file directly.",
         annotations(read_only_hint = true)
     )]
     async fn get_message(&self, Parameters(a): Parameters<GetArgs>) -> ToolResult {
@@ -738,13 +983,26 @@ impl Server {
                         "sent": m.date().map(|d| fmt_ts(d.to_timestamp())),
                         "body": truncate_chars(&body, a.max_chars),
                         "body_chars": body.chars().count(),
-                        "attachments": emlx::attachments(e, m),
                     });
+                    let (inline, real): (Vec<_>, Vec<_>) = emlx::attachments(e, m).into_iter().partition(|x| x.inline);
+                    v["attachments"] = json!(real);
+                    if !inline.is_empty() {
+                        v["inline_images"] = json!(inline.iter().map(|x| &x.name).collect::<Vec<_>>());
+                    }
                     if let Some(irt) = m.in_reply_to() {
                         v["in_reply_to"] = json!(irt.iter().collect::<Vec<_>>());
                     }
                     if a.links {
                         v["links"] = json!(emlx::links(m));
+                    }
+                    let invites = ical::invites(m);
+                    if !invites.is_empty() {
+                        v["invites"] = json!(invites);
+                    }
+                    if a.extract {
+                        let found = extract::from_message(m);
+                        v["codes"] = json!(found.codes);
+                        v["verify_links"] = json!(found.verify_links);
                     }
                     if a.all_headers {
                         let hs: Vec<(String, String)> = m
@@ -1195,82 +1453,125 @@ impl Server {
     }
 
     #[tool(
-        description = "Change messages in Mail: mark_read, mark_unread, flag, unflag, flag_color (with color), move (with mailbox), trash, junk, not_junk. Takes a list of ids.",
+        description = "Change messages in Mail: mark_read, mark_unread, flag, unflag, flag_color (with color), move (with mailbox), trash, junk, not_junk. Takes a list of ids, or a filter for bulk clean-up (e.g. trash everything from one newsletter): a filter call is a dry run by default that reports the matches, then repeat with dry_run false.",
         annotations(destructive_hint = true)
     )]
     async fn update_messages(&self, Parameters(a): Parameters<UpdateArgs>) -> ToolResult {
-        if a.ids.is_empty() {
+        const CHUNK: usize = 50;
+        let mut ids = a.ids.clone();
+        if let Some(filter) = a.filter {
+            if !ids.is_empty() {
+                return fail(anyhow!("pass ids or filter, not both"));
+            }
+            let max = a.max.unwrap_or(200).clamp(1, 2000);
+            let rows = tri!(self.with(move |s, index| bulk_select(s, index, &filter)).await);
+            if a.dry_run.unwrap_or(true) || rows.len() > max {
+                let mut out = json!({
+                    "action": a.action,
+                    "dry_run": true,
+                    "matches": rows.len(),
+                    "sample": rows.iter().take(10).collect::<Vec<_>>(),
+                });
+                if rows.len() > max {
+                    out["refused"] = json!(format!("{} messages match, more than max {max}; narrow the filter or raise max", rows.len()));
+                } else {
+                    out["next_step"] = json!("Show the user what matches; repeat with dry_run false to apply.");
+                }
+                return ok(&out);
+            }
+            ids = rows.into_iter().map(|r| r.id).collect();
+            if ids.is_empty() {
+                return ok(&json!({ "action": a.action, "changed": 0, "requested": 0, "errors": [] }));
+            }
+        }
+        if ids.is_empty() {
             return fail(anyhow!("no ids"));
         }
         let mut refs = Vec::new();
         let mut first_account = String::new();
-        for id in &a.ids {
+        for id in &ids {
             let (r, row) = tri!(self.msg_ref(*id).await);
             if first_account.is_empty() {
                 first_account = row.account.clone();
             }
             refs.push(r);
         }
-        let mut moved_to: Option<(i64, Vec<(i64, i64)>)> = None;
-        let res = match a.action.as_str() {
-            "mark_read" => script::set_status(&refs, "read", "true").await,
-            "mark_unread" => script::set_status(&refs, "read", "false").await,
-            "flag" => script::set_status(&refs, "flagged", "true").await,
-            "unflag" => script::set_status(&refs, "flagged", "false").await,
-            "junk" => script::set_status(&refs, "junk", "true").await,
-            "not_junk" => script::set_status(&refs, "junk", "false").await,
-            "flag_color" => {
-                let idx = match a.color.as_deref().unwrap_or("red") {
-                    "red" => 0,
-                    "orange" => 1,
-                    "yellow" => 2,
-                    "green" => 3,
-                    "blue" => 4,
-                    "purple" => 5,
-                    "gray" | "grey" => 6,
-                    c => return fail(anyhow!("unknown color '{c}'")),
-                };
-                script::set_status(&refs, "flag_color", &idx.to_string()).await
-            }
-            "trash" => script::trash(&refs).await,
-            "move" => {
-                let Some(target) = a.mailbox.clone() else {
-                    return fail(anyhow!("move needs a mailbox"));
-                };
-                let account = a.account.clone().unwrap_or(first_account);
-                let ids = a.ids.clone();
-                let dest = tri!(
-                    self.with(move |s, _| {
-                        let mb_ids = s.resolve_mailboxes(&target, Some(&account))?;
-                        let mbs: Vec<_> = mb_ids.iter().filter_map(|i| s.mailbox(*i)).collect();
-                        let mb = mbs
-                            .iter()
-                            .max_by_key(|m| m.total)
-                            .ok_or_else(|| anyhow!("no such mailbox"))?;
-                        let globals = ids
-                            .iter()
-                            .filter_map(|id| s.global_id(*id).ok().map(|g| (*id, g)))
-                            .collect::<Vec<_>>();
-                        Ok((
-                            if mb.local { String::new() } else { mb.account.clone() },
-                            mb.path.clone(),
-                            mb.id,
-                            globals,
-                        ))
-                    })
-                    .await
-                );
-                moved_to = Some((dest.2, dest.3));
-                script::move_to(&refs, &dest.0, &dest.1).await.map(|r| format!("{r}\n→ {}", dest.1))
-            }
-            other => return fail(anyhow!("unknown action '{other}'")),
+        let flag_color = match a.action.as_str() {
+            "flag_color" => match a.color.as_deref().unwrap_or("red") {
+                "red" => 0,
+                "orange" => 1,
+                "yellow" => 2,
+                "green" => 3,
+                "blue" => 4,
+                "purple" => 5,
+                "gray" | "grey" => 6,
+                c => return fail(anyhow!("unknown color '{c}'")),
+            },
+            _ => 0,
         };
-        let out = tri!(res);
-        let mut lines = out.lines();
-        let done: usize = lines.next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
-        let errors: Vec<&str> = lines.filter(|l| !l.trim().is_empty() && !l.starts_with('→')).collect();
-        let mut result = json!({ "action": a.action, "changed": done, "requested": a.ids.len(), "errors": errors });
-        if let Some((mailbox_id, globals)) = moved_to
+        let dest = if a.action == "move" {
+            let Some(target) = a.mailbox.clone() else {
+                return fail(anyhow!("move needs a mailbox"));
+            };
+            let account = a.account.clone().unwrap_or(first_account);
+            let ids = ids.clone();
+            Some(tri!(
+                self.with(move |s, _| {
+                    let mb_ids = s.resolve_mailboxes(&target, Some(&account))?;
+                    let mbs: Vec<_> = mb_ids.iter().filter_map(|i| s.mailbox(*i)).collect();
+                    let mb = mbs
+                        .iter()
+                        .max_by_key(|m| m.total)
+                        .ok_or_else(|| anyhow!("no such mailbox"))?;
+                    let globals = ids
+                        .iter()
+                        .filter_map(|id| s.global_id(*id).ok().map(|g| (*id, g)))
+                        .collect::<Vec<_>>();
+                    Ok((
+                        if mb.local { String::new() } else { mb.account.clone() },
+                        mb.path.clone(),
+                        mb.id,
+                        globals,
+                    ))
+                })
+                .await
+            ))
+        } else {
+            None
+        };
+        let mut done = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        for chunk in refs.chunks(CHUNK) {
+            let res = match a.action.as_str() {
+                "mark_read" => script::set_status(chunk, "read", "true").await,
+                "mark_unread" => script::set_status(chunk, "read", "false").await,
+                "flag" => script::set_status(chunk, "flagged", "true").await,
+                "unflag" => script::set_status(chunk, "flagged", "false").await,
+                "junk" => script::set_status(chunk, "junk", "true").await,
+                "not_junk" => script::set_status(chunk, "junk", "false").await,
+                "flag_color" => script::set_status(chunk, "flag_color", &flag_color.to_string()).await,
+                "trash" => script::trash(chunk).await,
+                "move" => {
+                    let d = dest.as_ref().expect("move resolves its destination first");
+                    script::move_to(chunk, &d.0, &d.1).await
+                }
+                other => return fail(anyhow!("unknown action '{other}'")),
+            };
+            match res {
+                Ok(out) => {
+                    let mut lines = out.lines();
+                    done += lines.next().and_then(|n| n.trim().parse::<usize>().ok()).unwrap_or(0);
+                    errors.extend(lines.filter(|l| !l.trim().is_empty()).map(String::from));
+                }
+                Err(e) if done == 0 => return fail(e),
+                Err(e) => {
+                    errors.push(format!("{e:#}"));
+                    break;
+                }
+            }
+        }
+        let mut result = json!({ "action": a.action, "changed": done, "requested": ids.len(), "errors": errors });
+        if let Some((_, _, mailbox_id, globals)) = dest
             && done > 0
         {
             let new_ids = self.find_moved(mailbox_id, globals).await;
@@ -1362,17 +1663,199 @@ impl Server {
         }
     }
 
+    #[tool(
+        description = "Clean up newsletters: action list shows every sender with a List-Unsubscribe header (count, unread, latest, category, how to unsubscribe). action unsubscribe leaves one list: a one-click POST (RFC 8058) when the sender supports it, else an unsubscribe mail, else it returns the web link for the user to open. Only unsubscribe when the user asked. To clear the old mail afterwards use update_messages with from.",
+        annotations(destructive_hint = true, open_world_hint = true)
+    )]
+    async fn unsubscribe(&self, Parameters(a): Parameters<UnsubArgs>) -> ToolResult {
+        let since = tri!(parse_when(a.since.as_deref().unwrap_or("180d")));
+        let account = a.account.clone();
+        let (msgs, mailboxes) = tri!(
+            self.with(move |s, index| {
+                index.lock().map_err(|_| anyhow!("index lock poisoned"))?.sync(s)?;
+                let mut skip = s.role_ids(&[Role::Sent, Role::Drafts, Role::Outbox, Role::Trash]);
+                if let Some(acc) = account.as_deref() {
+                    let mine = s.account_mailbox_ids(acc)?;
+                    skip.extend(s.mailboxes().iter().map(|m| m.id).filter(|id| !mine.contains(id)));
+                }
+                let msgs = s.subscriptions(since, &skip)?;
+                let names: HashMap<i64, String> = s.mailboxes().iter().map(|m| (m.id, m.path.clone())).collect();
+                Ok((msgs, names))
+            })
+            .await
+        );
+        if a.action.as_deref().unwrap_or("list") == "list" {
+            let mut order: Vec<String> = Vec::new();
+            let mut groups: HashMap<String, Vec<&crate::store::SubscriptionMsg>> = HashMap::new();
+            for m in &msgs {
+                let key = m.address.to_lowercase();
+                if !groups.contains_key(&key) {
+                    order.push(key.clone());
+                }
+                groups.entry(key).or_default().push(m);
+            }
+            order.sort_by_key(|k| std::cmp::Reverse(groups[k].len()));
+            let total = order.len();
+            let list: Vec<_> = order
+                .iter()
+                .take(a.limit.clamp(1, 500))
+                .map(|k| {
+                    let g = &groups[k];
+                    let latest = g[0];
+                    let mut boxes: Vec<&str> = g.iter().filter_map(|m| mailboxes.get(&m.mailbox_id).map(String::as_str)).collect();
+                    boxes.sort_unstable();
+                    boxes.dedup();
+                    json!({
+                        "sender": format_addr(&latest.address, &latest.name),
+                        "messages": g.len(),
+                        "unread": g.iter().filter(|m| !m.read).count(),
+                        "latest": fmt_ts(latest.ts),
+                        "latest_id": latest.id,
+                        "category": latest.category,
+                        "mailboxes": boxes,
+                        "unsubscribe": latest.unsubscribe,
+                    })
+                })
+                .collect();
+            return ok(&json!({ "senders": total, "since": fmt_ts(since), "lists": list }));
+        }
+        if a.action.as_deref() != Some("unsubscribe") {
+            return fail(anyhow!("unknown action (list, unsubscribe)"));
+        }
+        let target = match (a.id, a.sender.as_deref()) {
+            (Some(id), _) => msgs.iter().find(|m| m.id == id),
+            (None, Some(sender)) => {
+                let sender = sender.to_lowercase();
+                msgs.iter().find(|m| m.address.to_lowercase() == sender)
+            }
+            _ => return fail(anyhow!("unsubscribe needs id or sender")),
+        };
+        let Some(m) = target else {
+            return fail(anyhow!("no List-Unsubscribe header found for that message or sender in the last period; try since: \"2y\""));
+        };
+        let u = m.unsubscribe.clone();
+        let sender = format_addr(&m.address, &m.name);
+        if let (true, Some(url)) = (u.one_click, u.url.as_deref()) {
+            let out = tokio::process::Command::new("/usr/bin/curl")
+                .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "20", "--proto", "=https"])
+                .args(["-X", "POST", "-H", "Content-Type: application/x-www-form-urlencoded"])
+                .args(["--data", "List-Unsubscribe=One-Click", "--url", url])
+                .output()
+                .await;
+            let out = tri!(out.map_err(anyhow::Error::from));
+            let code: u16 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+            if (200..300).contains(&code) {
+                return ok(&json!({ "sender": sender, "method": "one_click", "status": "unsubscribed", "http_status": code }));
+            }
+            if u.mailto.is_none() {
+                return ok(&json!({
+                    "sender": sender, "method": "one_click", "status": "failed", "http_status": code,
+                    "error": String::from_utf8_lossy(&out.stderr).trim(),
+                    "url": url, "next_step": "Ask the user to open the url in a browser.",
+                }));
+            }
+        }
+        if let Some(mailto) = u.mailto.as_deref() {
+            tri!(self.may_send(true));
+            let (to, subject, body) = parse_mailto(mailto);
+            let o = Outgoing {
+                subject: subject.unwrap_or_else(|| "unsubscribe".into()),
+                body: body.unwrap_or_else(|| "unsubscribe".into()),
+                html: None,
+                from: String::new(),
+                to: vec![to.clone()],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                attachments: Vec::new(),
+                send: true,
+            };
+            let (status, _) = tri!(script::compose_window(Kind::New, None, &o).await);
+            return ok(&json!({ "sender": sender, "method": "mail", "to": to, "status": if status == "sent" { "unsubscribe mail sent" } else { status.as_str() } }));
+        }
+        ok(&json!({
+            "sender": sender,
+            "method": "web",
+            "status": "needs the user",
+            "url": u.url,
+            "next_step": "This sender only offers a web page. Give the user the url to open; it may ask for a confirmation click.",
+        }))
+    }
+
+    #[tool(
+        description = "Find people you correspond with: name and address, how many mails they sent you and you sent them, and when. Use it to resolve \"write to Anna\" into an address. Newsletters and no-reply senders are left out unless include_automated.",
+        annotations(read_only_hint = true)
+    )]
+    async fn contacts(&self, Parameters(a): Parameters<ContactArgs>) -> ToolResult {
+        let me: HashSet<String> = self.me().await.into_iter().map(|x| x.to_lowercase()).collect();
+        let (received, sent, lists) = tri!(
+            self.with(|s, _| {
+                let skip = s.role_ids(&[Role::Sent, Role::Drafts, Role::Outbox, Role::Trash, Role::Junk]);
+                let sent_ids = s.role_ids(&[Role::Sent]);
+                let lists: HashSet<String> =
+                    s.subscriptions(0, &[]).map(|v| v.into_iter().map(|m| m.address.to_lowercase()).collect()).unwrap_or_default();
+                Ok((s.sender_counts(&skip)?, s.recipient_counts(&sent_ids)?, lists))
+            })
+            .await
+        );
+        #[derive(Default)]
+        struct C {
+            name: String,
+            received: i64,
+            sent: i64,
+            last_received: i64,
+            last_sent: i64,
+        }
+        let mut all: HashMap<String, C> = HashMap::new();
+        for (addr, name, n, ts) in received {
+            let c = all.entry(addr).or_default();
+            c.received = n;
+            c.last_received = ts;
+            if !name.is_empty() {
+                c.name = name;
+            }
+        }
+        for (addr, name, n, ts) in sent {
+            let c = all.entry(addr).or_default();
+            c.sent = n;
+            c.last_sent = ts;
+            if c.name.is_empty() {
+                c.name = name;
+            }
+        }
+        let q = a.query.as_deref().map(|q| fold(q.trim())).filter(|q| !q.is_empty());
+        let mut hits: Vec<(String, C)> = all
+            .into_iter()
+            .filter(|(addr, _)| !addr.is_empty() && !me.contains(addr))
+            .filter(|(addr, c)| a.include_automated || c.sent > 0 || !(is_automated(addr) || lists.contains(addr)))
+            .filter(|(addr, c)| q.as_ref().is_none_or(|q| fold(addr).contains(q) || fold(&c.name).contains(q)))
+            .collect();
+        hits.sort_by_key(|(_, c)| std::cmp::Reverse((c.sent * 3 + c.received, c.last_sent.max(c.last_received))));
+        let total = hits.len();
+        let list: Vec<_> = hits
+            .into_iter()
+            .take(a.limit.clamp(1, 500))
+            .map(|(addr, c)| {
+                let mut v = json!({ "address": addr, "received": c.received, "sent": c.sent });
+                if !c.name.is_empty() {
+                    v["name"] = json!(c.name);
+                }
+                if c.last_received > 0 {
+                    v["last_received"] = json!(fmt_ts(c.last_received));
+                }
+                if c.last_sent > 0 {
+                    v["last_sent"] = json!(fmt_ts(c.last_sent));
+                }
+                v
+            })
+            .collect();
+        ok(&json!({ "total": total, "contacts": list }))
+    }
+
     #[tool(description = "Create a new mailbox (folder) in an account. Use 'Parent/Child' for nesting.")]
     async fn create_mailbox(&self, Parameters(a): Parameters<MailboxArgs>) -> ToolResult {
         let account = match a.account.clone() {
             Some(x) => x,
-            None => {
-                let accs = tri!(self.with(|s, _| Ok(s.accounts())).await);
-                match accs.iter().find(|x| x.name != "On My Mac" && x.name != "Auf meinem Mac") {
-                    Some(x) => x.name.clone(),
-                    None => String::new(),
-                }
-            }
+            None => self.default_account().await,
         };
         if tri!(script::create_mailbox(&account, &a.name).await) != "ok" {
             return fail(anyhow!(
@@ -1382,6 +1865,57 @@ impl Server {
             ));
         }
         ok(&json!({ "created": a.name, "account": account }))
+    }
+
+    #[tool(
+        description = "Rename a mailbox. Mail's own folders (inbox, sent, drafts, trash, junk, archive) are refused. Deleting a mailbox is not possible: Mail's scripting refuses it, so ask the user to do it in Mail.",
+        annotations(destructive_hint = false)
+    )]
+    async fn rename_mailbox(&self, Parameters(a): Parameters<RenameMailboxArgs>) -> ToolResult {
+        let new_name = a.new_name.trim().to_string();
+        if new_name.is_empty() || new_name.contains('/') {
+            return fail(anyhow!("new_name is the folder's own name, without '/'; moving a folder elsewhere is not supported"));
+        }
+        let spec = a.mailbox.clone();
+        let account = a.account.clone();
+        let found = tri!(
+            self.with(move |s, _| {
+                let Ok(ids) = s.resolve_mailboxes(&spec, account.as_deref()) else {
+                    return Ok(None);
+                };
+                if ids.len() != 1 {
+                    bail!("'{spec}' matches {} mailboxes; pass account or the mailbox id", ids.len());
+                }
+                let mb = s.mailbox(ids[0]).ok_or_else(|| anyhow!("no such mailbox"))?;
+                if mb.role != Role::Other {
+                    bail!("'{}' is one of Mail's own mailboxes and keeps its name", mb.path);
+                }
+                Ok(Some((if mb.local { String::new() } else { mb.account.clone() }, mb.path.clone())))
+            })
+            .await
+        );
+        // Mail adds a mailbox to its index only once it holds mail, so a new
+        // empty folder is known to Mail alone.
+        let (acc, path) = match found {
+            Some(f) => f,
+            None => {
+                let path = a.mailbox.trim().trim_matches('/').to_string();
+                if Role::parse(path.rsplit('/').next().unwrap_or(&path)).is_some() {
+                    return fail(anyhow!("'{path}' is one of Mail's own mailboxes and keeps its name"));
+                }
+                let acc = match a.account.clone() {
+                    Some(x) => x,
+                    None => self.default_account().await,
+                };
+                (acc, path)
+            }
+        };
+        tri!(script::rename_mailbox(&acc, &path, &new_name).await);
+        let new_path = match path.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{new_name}"),
+            None => new_name,
+        };
+        ok(&json!({ "renamed": path, "to": new_path, "account": acc }))
     }
 
     #[tool(description = "Ask Mail to fetch new mail and sync an account (or all accounts).")]
@@ -1435,6 +1969,15 @@ pub struct UpdateToolArgs {
 }
 
 impl Server {
+    /// The first real account; "" means Mail's local "On My Mac".
+    async fn default_account(&self) -> String {
+        let accs = self.with(|s, _| Ok(s.accounts())).await.unwrap_or_default();
+        accs.iter()
+            .find(|x| x.name != "On My Mac" && x.name != "Auf meinem Mac")
+            .map(|x| x.name.clone())
+            .unwrap_or_default()
+    }
+
     fn may_send(&self, send: bool) -> Result<()> {
         if send && self.inner.config.send_locked {
             bail!(
@@ -1602,7 +2145,9 @@ fn awaiting_reply(s: &Store, me: &HashSet<String>, since: i64, limit: usize) -> 
 
 const INSTRUCTIONS: &str = "mailidx reads Apple Mail's own index and message files directly, so every read tool is instant and Mail.app does not need to do anything. \
 Start with overview or search. Message ids work in every tool; moving a message gives it a new id, which update_messages returns as new_ids. \
-Writing tools (compose, reply, forward, update_messages, drafts, create_mailbox, check_mail) go through Mail via AppleScript; compose/reply/forward save drafts unless send=true. \
+To check that a mail arrives (contact form, sign-up, password reset) use wait_for, with extract=true for its code or confirm link. contacts turns a name into an address. \
+For clean-up: unsubscribe lists newsletters and leaves one on request; update_messages with a filter clears old mail in bulk, always as a dry run first that you show the user. \
+Writing tools (compose, reply, forward, update_messages, drafts, create_mailbox, rename_mailbox, check_mail, unsubscribe) go through Mail via AppleScript or the sender's unsubscribe link; compose/reply/forward save drafts unless send=true. \
 Only set send=true when the user clearly asked to send. Permanent deletion is not available; trash moves to the account's trash. \
 If a tool result contains a line starting with 'mailidx update:', tell the user that a new mailidx version is available and offer the update tool; do not install it without their agreement. \
 The user's settings may lock sending (drafts only) or hide accounts and mailboxes; hidden mail does not exist for any tool.";
@@ -1632,5 +2177,24 @@ impl ServerHandler for Server {
             r.content.push(ContentBlock::text(note));
         }
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mailto_parts() {
+        let (to, subject, body) = parse_mailto("mailto:list@example.com?subject=Abmelden%20bitte&body=stop+now");
+        assert_eq!(to, "list@example.com");
+        assert_eq!(subject.as_deref(), Some("Abmelden bitte"));
+        assert_eq!(body.as_deref(), Some("stop now"));
+        assert_eq!(parse_mailto("mailto:a@b.c").1, None);
+    }
+
+    #[test]
+    fn folds_diacritics() {
+        assert_eq!(fold("Müller"), "muller");
     }
 }

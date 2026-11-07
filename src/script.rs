@@ -453,6 +453,27 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub async fn rename_mailbox(account: &str, path: &str, new_name: &str) -> Result<String> {
+    run(
+        r#"
+    set acc to item 1 of argv
+    set p to item 2 of argv
+    set nm to item 3 of argv
+    tell application "Mail"
+        if acc is "" then
+            set mb to mailbox p
+        else
+            set mb to mailbox p of account acc
+        end if
+        set name of mb to nm
+    end tell
+    return "ok"
+"#,
+        &[account.to_string(), path.to_string(), new_name.to_string()],
+    )
+    .await
+}
+
 pub async fn create_mailbox(account: &str, name: &str) -> Result<String> {
     run(
         r#"
