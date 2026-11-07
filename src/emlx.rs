@@ -183,7 +183,7 @@ pub fn links(msg: &Message<'_>) -> Vec<String> {
     fn push(out: &mut Vec<String>, u: &str) {
         let u = u.trim().replace("&amp;", "&");
         if (u.starts_with("http://") || u.starts_with("https://") || u.starts_with("mailto:"))
-            && !out.contains(&u)
+            && !out.iter().any(|o| o.trim_end_matches('/') == u.trim_end_matches('/'))
         {
             out.push(u);
         }
@@ -202,12 +202,11 @@ pub fn links(msg: &Message<'_>) -> Vec<String> {
         }
         i += 1;
     }
-    if out.is_empty() {
-        let text = body_text(msg);
-        for w in text.split(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"') {
-            if w.starts_with("http://") || w.starts_with("https://") {
-                push(&mut out, w.trim_end_matches(['.', ',', ')', ']']));
-            }
+    // URLs typed into a plain-text part (or HTML without an anchor) carry no href.
+    let text = body_text(msg);
+    for w in text.split(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"') {
+        if w.starts_with("http://") || w.starts_with("https://") {
+            push(&mut out, w.trim_end_matches(['.', ',', ')', ']']));
         }
     }
     out
@@ -221,9 +220,21 @@ pub struct AttachmentInfo {
     pub size: usize,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub on_disk_only: bool,
+    /// Small image the HTML shows in place (signature logo, icon): not a real attachment.
+    #[serde(skip)]
+    pub inline: bool,
 }
 
+/// Larger embedded images are usually photos the sender meant to attach.
+const INLINE_MAX_BYTES: usize = 64 * 1024;
+
 pub fn attachments(emlx: &Emlx, msg: &Message<'_>) -> Vec<AttachmentInfo> {
+    let mut html = String::new();
+    let mut i = 0;
+    while let Some(h) = msg.body_html(i) {
+        html.push_str(&h);
+        i += 1;
+    }
     let mut out = Vec::new();
     for (index, part) in msg.attachments().enumerate() {
         let name = part.attachment_name().unwrap_or("").to_string();
@@ -238,7 +249,13 @@ pub fn attachments(emlx: &Emlx, msg: &Message<'_>) -> Vec<AttachmentInfo> {
                 size = std::fs::metadata(&p).map(|m| m.len() as usize).unwrap_or(0);
                 on_disk_only = true;
             }
-        out.push(AttachmentInfo { index, name, mime, size, on_disk_only });
+        let inline = size <= INLINE_MAX_BYTES
+            && mime.starts_with("image/")
+            && part
+                .content_id()
+                .map(|c| c.trim_matches(['<', '>']))
+                .is_some_and(|c| !c.is_empty() && html.contains(&format!("cid:{c}")));
+        out.push(AttachmentInfo { index, name, mime, size, on_disk_only, inline });
     }
     out
 }
@@ -303,5 +320,63 @@ mod tests {
     fn filenames() {
         assert_eq!(sanitize_filename("../../etc/passwd"), "_.._etc_passwd");
         assert_eq!(sanitize_filename(""), "attachment");
+    }
+}
+
+pub fn raw_header(msg: &Message<'_>, name: &str) -> Option<String> {
+    msg.headers().iter().find(|h| h.name().as_str().eq_ignore_ascii_case(name)).map(|h| {
+        String::from_utf8_lossy(h.raw_value()).split_whitespace().collect::<Vec<_>>().join(" ")
+    })
+}
+
+#[derive(Debug, Default, Serialize, Clone, PartialEq)]
+pub struct Unsubscribe {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailto: Option<String>,
+    /// RFC 8058: a single POST unsubscribes, no page to click through.
+    pub one_click: bool,
+}
+
+pub fn unsubscribe(msg: &Message<'_>) -> Option<Unsubscribe> {
+    let header = raw_header(msg, "List-Unsubscribe")?;
+    let post = raw_header(msg, "List-Unsubscribe-Post").unwrap_or_default();
+    parse_unsubscribe(&header, &post)
+}
+
+pub fn parse_unsubscribe(header: &str, post: &str) -> Option<Unsubscribe> {
+    let mut u = Unsubscribe::default();
+    for part in header.split('<').skip(1) {
+        let target = part.split('>').next().unwrap_or("").trim();
+        let lower = target.to_ascii_lowercase();
+        if lower.starts_with("https://") || lower.starts_with("http://") {
+            u.url.get_or_insert_with(|| target.to_string());
+        } else if lower.starts_with("mailto:") {
+            u.mailto.get_or_insert_with(|| target.to_string());
+        }
+    }
+    u.one_click = u.url.as_deref().is_some_and(|x| x.starts_with("https://"))
+        && post.to_ascii_lowercase().replace(' ', "").contains("list-unsubscribe=one-click");
+    (u.url.is_some() || u.mailto.is_some()).then_some(u)
+}
+
+#[cfg(test)]
+mod unsubscribe_tests {
+    use super::*;
+
+    #[test]
+    fn reads_list_unsubscribe() {
+        let u = parse_unsubscribe(
+            "<mailto:unsub@example.com?subject=stop>, <https://example.com/u/1>",
+            "List-Unsubscribe=One-Click",
+        )
+        .unwrap();
+        assert_eq!(u.url.as_deref(), Some("https://example.com/u/1"));
+        assert_eq!(u.mailto.as_deref(), Some("mailto:unsub@example.com?subject=stop"));
+        assert!(u.one_click);
+        let plain = parse_unsubscribe("<http://example.com/u>", "List-Unsubscribe=One-Click").unwrap();
+        assert!(!plain.one_click, "one-click needs https");
+        assert!(parse_unsubscribe("no brackets here", "").is_none());
     }
 }

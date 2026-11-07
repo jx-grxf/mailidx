@@ -139,6 +139,7 @@ pub struct Recipient {
 #[derive(Debug, Default, Clone)]
 pub struct Filter {
     pub ids: Option<Vec<i64>>,
+    pub after_id: Option<i64>,
     pub mailbox_ids: Option<Vec<i64>>,
     pub exclude_mailbox_ids: Vec<i64>,
     pub from: Option<String>,
@@ -153,13 +154,26 @@ pub struct Filter {
     pub thread: Option<i64>,
     pub category: Option<i64>,
     pub important: Option<bool>,
+    pub invite: Option<bool>,
     pub limit: usize,
     pub offset: usize,
     pub oldest_first: bool,
 }
 
+pub struct SubscriptionMsg {
+    pub id: i64,
+    pub address: String,
+    pub name: String,
+    pub ts: i64,
+    pub read: bool,
+    pub mailbox_id: i64,
+    pub category: Option<&'static str>,
+    pub unsubscribe: crate::emlx::Unsubscribe,
+}
+
 pub struct Store {
     conn: Connection,
+    has_index: bool,
     pub mail_root: PathBuf,
     mailboxes: Vec<Mailbox>,
     mailbox_dirs: HashMap<i64, Option<PathBuf>>,
@@ -233,7 +247,9 @@ impl Store {
         .with_context(|| format!("cannot open {}", db.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(3))?;
         check_schema(&conn)?;
+        let has_index = attach_index(&conn);
         let mut store = Store {
+            has_index,
             conn,
             mail_root,
             mailboxes: Vec::new(),
@@ -393,11 +409,21 @@ impl Store {
         self.mailboxes.iter().filter(|m| roles.contains(&m.role)).map(|m| m.id).collect()
     }
 
+    fn attachment_count_sql(&self) -> &'static str {
+        if self.has_index {
+            "MAX(0, (SELECT COUNT(*) FROM attachments t WHERE t.message = m.ROWID)
+                  - COALESCE((SELECT x.inline FROM idx.doc x WHERE x.id = m.ROWID), 0))"
+        } else {
+            "(SELECT COUNT(*) FROM attachments t WHERE t.message = m.ROWID)"
+        }
+    }
+
     pub fn list(&self, f: &Filter) -> Result<Vec<MessageRow>> {
-        let mut sql = String::from(
+        let att = self.attachment_count_sql();
+        let mut sql = format!(
             "SELECT m.ROWID, COALESCE(m.subject_prefix,'') || COALESCE(s.subject,''), a.address, a.comment,
                     m.date_received, m.mailbox, m.read, m.flagged, m.flags, m.conversation_id,
-                    (SELECT COUNT(*) FROM attachments t WHERE t.message = m.ROWID), su.summary,
+                    {att}, su.summary,
                     g.model_category, COALESCE(g.model_high_impact, 0), gs.summary
              FROM messages m
              LEFT JOIN message_global_data g ON g.ROWID = m.global_message_id
@@ -417,6 +443,10 @@ impl Store {
                 return Ok(Vec::new());
             }
             in_list(&mut sql, "m.ROWID", ids, false);
+        }
+        if let Some(id) = f.after_id {
+            sql.push_str(" AND m.ROWID > ?");
+            args.push(id.into());
         }
         if let Some(mbs) = &f.mailbox_ids {
             if mbs.is_empty() {
@@ -467,11 +497,7 @@ impl Store {
             sql.push_str(&format!(" AND (m.flags & {FLAG_ANSWERED}) {} 0", if an { "!=" } else { "=" }));
         }
         if let Some(h) = f.has_attachments {
-            sql.push_str(if h {
-                " AND EXISTS (SELECT 1 FROM attachments t WHERE t.message = m.ROWID)"
-            } else {
-                " AND NOT EXISTS (SELECT 1 FROM attachments t WHERE t.message = m.ROWID)"
-            });
+            sql.push_str(&format!(" AND {att} {} 0", if h { ">" } else { "=" }));
         }
         if let Some(c) = f.category {
             sql.push_str(" AND g.model_category = ?");
@@ -479,6 +505,15 @@ impl Store {
         }
         if let Some(i) = f.important {
             sql.push_str(if i { " AND g.model_high_impact = 1" } else { " AND COALESCE(g.model_high_impact,0) = 0" });
+        }
+        if let Some(inv) = f.invite {
+            if !self.has_index {
+                bail!("has_invite needs the search index; run `mailidx index` once");
+            }
+            sql.push_str(&format!(
+                " AND COALESCE((SELECT x.invite FROM idx.doc x WHERE x.id = m.ROWID), 0) = {}",
+                inv as i64
+            ));
         }
         if let Some(c) = f.thread {
             sql.push_str(" AND m.conversation_id = ?");
@@ -661,6 +696,75 @@ impl Store {
         Ok(out)
     }
 
+    /// Messages carrying a List-Unsubscribe header, newest first.
+    pub fn subscriptions(&self, since: i64, exclude: &[i64]) -> Result<Vec<SubscriptionMsg>> {
+        if !self.has_index {
+            bail!("needs the search index; run `mailidx index` once");
+        }
+        let hidden: Vec<String> = self.hidden.iter().chain(exclude).map(|i| i.to_string()).collect();
+        let not_in = if hidden.is_empty() { String::new() } else { format!(" AND m.mailbox NOT IN ({})", hidden.join(",")) };
+        let sql = format!(
+            "SELECT m.ROWID, COALESCE(a.address,''), COALESCE(a.comment,''), m.date_received, m.read, m.mailbox,
+                    g.model_category, x.unsub_url, x.unsub_mailto, x.unsub_one_click
+             FROM messages m
+             JOIN idx.doc x ON x.id = m.ROWID
+             LEFT JOIN addresses a ON a.ROWID = m.sender
+             LEFT JOIN message_global_data g ON g.ROWID = m.global_message_id
+             WHERE m.deleted = 0 AND m.date_received >= ?
+               AND (x.unsub_url IS NOT NULL OR x.unsub_mailto IS NOT NULL){not_in}
+             ORDER BY m.date_received DESC"
+        );
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map([since], |r| {
+            Ok(SubscriptionMsg {
+                id: r.get(0)?,
+                address: r.get(1)?,
+                name: r.get(2)?,
+                ts: r.get(3)?,
+                read: r.get::<_, i64>(4)? != 0,
+                mailbox_id: r.get(5)?,
+                category: r.get::<_, Option<i64>>(6)?.and_then(category_name),
+                unsubscribe: crate::emlx::Unsubscribe {
+                    url: r.get(7)?,
+                    mailto: r.get(8)?,
+                    one_click: r.get::<_, i64>(9)? != 0,
+                },
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// (address, display name, messages, latest date) for senders of mail outside `exclude`.
+    pub fn sender_counts(&self, exclude: &[i64]) -> Result<Vec<(String, String, i64, i64)>> {
+        let skip: Vec<String> = self.hidden.iter().chain(exclude).map(|i| i.to_string()).collect();
+        let not_in = if skip.is_empty() { String::new() } else { format!(" AND m.mailbox NOT IN ({})", skip.join(",")) };
+        self.address_counts(&format!(
+            "SELECT LOWER(a.address), MAX(COALESCE(a.comment,'')), COUNT(*), MAX(m.date_received)
+             FROM messages m JOIN addresses a ON a.ROWID = m.sender
+             WHERE m.deleted = 0{not_in} GROUP BY LOWER(a.address)"
+        ))
+    }
+
+    /// Same for recipients (to/cc) of mail in `include`, i.e. the sent mailboxes.
+    pub fn recipient_counts(&self, include: &[i64]) -> Result<Vec<(String, String, i64, i64)>> {
+        let ids: Vec<String> = include.iter().filter(|i| !self.hidden.contains(i)).map(|i| i.to_string()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.address_counts(&format!(
+            "SELECT LOWER(ra.address), MAX(COALESCE(ra.comment,'')), COUNT(DISTINCT m.ROWID), MAX(m.date_received)
+             FROM recipients r JOIN messages m ON m.ROWID = r.message JOIN addresses ra ON ra.ROWID = r.address
+             WHERE m.deleted = 0 AND m.mailbox IN ({}) GROUP BY LOWER(ra.address)",
+            ids.join(",")
+        ))
+    }
+
+    fn address_counts(&self, sql: &str) -> Result<Vec<(String, String, i64, i64)>> {
+        let mut st = self.conn.prepare(sql)?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn fingerprint(&self) -> Result<(i64, i64)> {
         Ok(self.conn.query_row(
             "SELECT COALESCE(MAX(ROWID),0), COUNT(*) FROM messages WHERE deleted = 0",
@@ -668,6 +772,25 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?)
     }
+}
+
+/// Our own index knows inline images, unsubscribe headers and invitations.
+/// It is attached to the read-only connection, so it is only read; an index
+/// from an older mailidx without those columns is left out.
+fn attach_index(conn: &Connection) -> bool {
+    let Some(path) = crate::fts::index_path().ok().filter(|p| p.exists()) else {
+        return false;
+    };
+    if conn.execute("ATTACH DATABASE ? AS idx", [path.to_string_lossy()]).is_err() {
+        return false;
+    }
+    let ok = conn
+        .prepare("SELECT inline, unsub_url, unsub_mailto, unsub_one_click, invite FROM idx.doc LIMIT 0")
+        .is_ok();
+    if !ok {
+        let _ = conn.execute("DETACH DATABASE idx", []);
+    }
+    ok
 }
 
 /// Mail writes folder names in NFD on disk while the index stores them
