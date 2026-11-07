@@ -9,7 +9,7 @@ An Apple Mail MCP server for macOS. It lets Claude, Codex or any other MCP clien
 ![Rust](https://img.shields.io/badge/rust-2024-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-[Install](#install) · [Settings](#settings) · [Tools](#tools) · [Benchmark](#benchmark) · [How it works](#how-it-works)
+[Install](#install) · [Tools](docs/tools.md) · [Recipes](docs/recipes.md) · [How it works](docs/architecture.md) · [Settings](#settings) · [Benchmark](#benchmark)
 
 </div>
 
@@ -27,15 +27,28 @@ An Apple Mail MCP server for macOS. It lets Claude, Codex or any other MCP clien
 - Whole threads across mailboxes, raw source for header checks, attachments saved to disk, export to `.eml`, Markdown or JSON.
 - Apple Intelligence categories (primary, transactions, updates, promotions) and the "important" mark, as Mail assigned them on this Mac.
 - `triage` lists mail from real people you have not answered, and mail you sent that got no reply.
+- Calendar invitations are read from the message: title, time, place, organizer and who has answered.
+- Signature logos and other small inline images do not count as attachments.
+
+**Testing** your own forms and sign-ups
+
+- `wait_for` waits until a matching mail arrives and tells you which mailbox it landed in, junk included.
+- One-time codes and confirm links are pulled out of the message, so an agent can finish a sign-up or approve an entry without reading the whole mail.
 
 **Writing** goes through Mail itself
 
 - New mail, replies and forwards open Mail's own compose window, so your signature, the quoted original and forwarded attachments look exactly like they do when you click the button yourself.
 - Everything is saved as a draft unless the caller passes `send: true`.
 - Mark read or unread, flag with a color, move, junk, trash, create mailboxes, send or discard drafts, fetch new mail.
-- There is no permanent delete. Trash only.
+- Rename mailboxes. There is no permanent delete. Trash only.
 
-Your mail never leaves the Mac. The only network request is a check for a new mailidx release on GitHub, at most once a day, and you can turn it off.
+**Cleaning up**
+
+- `unsubscribe` lists every newsletter you get, grouped by sender with counts and unread mail, and leaves one on request: one-click where the sender supports it (RFC 8058), else by mail, else it hands you the link.
+- `update_messages` takes a filter for bulk work, such as everything from one sender or all promotions older than a month. It shows the matches first and changes nothing until it is called again with `dry_run: false`.
+- `contacts` finds the people you actually write with, by name or address, without newsletters and no-reply senders.
+
+Your mail never leaves the Mac. mailidx itself only talks to GitHub to check for a new release, at most once a day and only if you leave that on, and to a newsletter's unsubscribe address when you ask it to leave that list.
 
 ## Install
 
@@ -92,18 +105,20 @@ When a newer release exists, the first tool result of a session carries a short 
 
 | Tool | What it does |
 |---|---|
-| `accounts`, `mailboxes` | Accounts with addresses, mailboxes with roles and counts |
-| `list_messages` | Messages in a mailbox, newest first, with filters |
-| `search` | Full-text search plus filters for sender, recipient, date, unread, flagged, attachments, category |
-| `get_message`, `get_thread`, `get_source` | One message, a whole conversation, or the raw RFC 822 source |
+| `overview`, `accounts`, `mailboxes` | Inbox dashboard, accounts with addresses, mailboxes with roles and counts |
+| `list_messages`, `search` | Messages in a mailbox; full-text search with filters for sender, recipient, date, unread, flagged, attachments, invitations, category |
+| `get_message`, `get_thread`, `get_source` | One message with invitations and extracted codes, a whole conversation, or the raw source |
+| `wait_for` | Wait for a new matching mail, with its code and confirm link |
+| `contacts` | People you write with, by name or address |
 | `save_attachments`, `export_messages` | Attachments to disk, messages to `.eml`, `.md` or `.json` |
-| `stats`, `overview`, `triage` | Volume and top senders, an inbox dashboard, who waits for a reply |
-| `index_status` | State of the search index, with optional rebuild |
-| `compose`, `reply`, `forward` | Write mail through Mail's own compose window, draft by default |
-| `update_messages` | Read, unread, flag, flag color, move, trash, junk |
-| `drafts` | List, send or trash drafts |
-| `create_mailbox`, `check_mail`, `open_in_mail` | New folder, fetch mail, show a message in Mail |
-| `update` | Check for a newer mailidx release and install it |
+| `stats`, `triage` | Volume and top senders; who waits for a reply |
+| `compose`, `reply`, `forward`, `drafts` | Write through Mail's own compose window, draft by default |
+| `update_messages` | Read, unread, flag, move, trash, junk, by ids or by filter in bulk |
+| `unsubscribe` | List newsletters and leave them |
+| `create_mailbox`, `rename_mailbox`, `check_mail`, `open_in_mail` | Folders, fetch mail, show a message in Mail |
+| `index_status`, `update` | Search index state and rebuild; install a newer mailidx |
+
+Parameters and details for each tool: [docs/tools.md](docs/tools.md). Typical jobs step by step: [docs/recipes.md](docs/recipes.md).
 
 ## Benchmark
 
@@ -121,10 +136,7 @@ Rebuilding the whole search index for those messages takes well under a second.
 
 ## How it works
 
-- Mail keeps every message's metadata in `~/Library/Mail/V*/MailData/Envelope Index`, a SQLite database. mailidx opens it read-only and checks at startup that the columns it needs exist, so a changed schema in a future macOS fails with a clear message.
-- Message bodies come from the `.emlx` files next to it. Messages Mail has not downloaded completely are flagged and indexed once they are.
-- The search index lives in `~/Library/Caches/mailidx/index.sqlite` (mode 0600) and syncs incrementally.
-- Writes run AppleScript through `osascript`. Values are passed as arguments, never pasted into the script text. The clipboard is saved before a paste and restored afterwards, all items and types.
+mailidx opens Mail's SQLite "Envelope Index" read-only, reads message bodies from the `.emlx` files and keeps its own full-text index in `~/Library/Caches/mailidx/index.sqlite`. Writes run AppleScript through `osascript`, with every value passed as an argument. The details, including how inline images and codes are recognized and what Mail's scripting cannot do, are in [docs/architecture.md](docs/architecture.md).
 
 ## Command line
 
