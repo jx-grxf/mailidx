@@ -1,6 +1,6 @@
 [package]
 name = "mailidx"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Fast Apple Mail MCP server for macOS: reads Mail's own index directly, full-text search in milliseconds"
 license = "MIT"
