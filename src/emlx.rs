@@ -249,12 +249,16 @@ pub fn attachments(emlx: &Emlx, msg: &Message<'_>) -> Vec<AttachmentInfo> {
                 size = std::fs::metadata(&p).map(|m| m.len() as usize).unwrap_or(0);
                 on_disk_only = true;
             }
-        let inline = size <= INLINE_MAX_BYTES
-            && mime.starts_with("image/")
-            && part
-                .content_id()
-                .map(|c| c.trim_matches(['<', '>']))
-                .is_some_and(|c| !c.is_empty() && html.contains(&format!("cid:{c}")));
+        // Most clients reference the image by cid:. Apple Mail instead places it
+        // between HTML parts with Content-Disposition: inline and no Content-ID.
+        let referenced = part
+            .content_id()
+            .map(|c| c.trim_matches(['<', '>']))
+            .is_some_and(|c| !c.is_empty() && html.contains(&format!("cid:{c}")));
+        let disposition_inline = part
+            .content_disposition()
+            .is_some_and(|d| d.ctype().eq_ignore_ascii_case("inline"));
+        let inline = size <= INLINE_MAX_BYTES && mime.starts_with("image/") && (referenced || disposition_inline);
         out.push(AttachmentInfo { index, name, mime, size, on_disk_only, inline });
     }
     out
@@ -378,5 +382,34 @@ mod unsubscribe_tests {
         let plain = parse_unsubscribe("<http://example.com/u>", "List-Unsubscribe=One-Click").unwrap();
         assert!(!plain.one_click, "one-click needs https");
         assert!(parse_unsubscribe("no brackets here", "").is_none());
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    // Apple Mail's layout: plain text, then a mixed part where the logo sits between HTML parts.
+    const APPLE_MAIL: &str = "From: a@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/alternative; boundary=\"a\"\r\n\r\n\
+--a\r\nContent-Type: text/plain\r\n\r\nHi\r\n\
+--a\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/html\r\n\r\n<p>Hi</p>\r\n\
+--b\r\nContent-Disposition: attachment; filename=\"photo.png\"\r\nContent-Type: image/png\r\n\
+Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n\
+--b\r\nContent-Type: text/html\r\n\r\n<br>\r\n\
+--b\r\nContent-Disposition: inline; filename=\"logo.png\"\r\nContent-Type: image/png\r\n\
+Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n\
+--b\r\nContent-Type: text/html\r\n\r\n<p>Johannes</p>\r\n\
+--b--\r\n\
+--a--\r\n";
+
+    #[test]
+    fn apple_mail_inline_image_is_not_an_attachment() {
+        let e = Emlx { raw: APPLE_MAIL.as_bytes().to_vec(), partial: false, path: PathBuf::from("/x/1.emlx") };
+        let msg = parse(&e.raw).unwrap();
+        let a = attachments(&e, &msg);
+        let names: Vec<(&str, bool)> = a.iter().map(|x| (x.name.as_str(), x.inline)).collect();
+        assert_eq!(names, vec![("photo.png", false), ("logo.png", true)]);
     }
 }

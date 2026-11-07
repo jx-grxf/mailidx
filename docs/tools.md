@@ -131,14 +131,14 @@ Ask Mail to fetch new mail now. Open a message in a Mail window so the user can 
 `action: "unsubscribe"` with an `id` or a `sender` leaves that list:
 
 1. One-click (RFC 8058): if the sender supports it, mailidx sends the single HTTPS POST the standard defines. Nothing else is needed.
-2. Mail: otherwise, if the sender offers a `mailto:` address, mailidx sends the unsubscribe mail through Mail. This counts as sending and is refused when `send_locked` is on.
+2. Mail: otherwise, if the sender offers a `mailto:` address, mailidx sends the unsubscribe mail through Mail.
 3. Web: if there is only a web page, the result contains the link for the user to open.
 
-Agents only unsubscribe when the user asked for it.
+With `send_locked` on, unsubscribing is refused, one-click included. Agents only unsubscribe when the user asked for it.
 
 ### `update_messages` with `filter`
 
-The filter takes `query`, `from`, `to`, `subject`, `mailbox`, `account`, `since`, `until`, `unread`, `flagged` and `category`. Without `mailbox`, trash and junk are left out.
+The filter takes `query`, `from`, `to`, `subject`, `mailbox`, `account`, `since`, `until`, `unread`, `flagged` and `category`. Without `mailbox`, trash, junk, sent mail, drafts and the outbox are left out; name one as `mailbox` to include it.
 
 - A filter call is a dry run unless `dry_run: false` is passed. It returns the number of matches and the first ten, so the agent can show them before anything changes.
 - More matches than `max` (default 200, at most 2000) and nothing changes.

@@ -87,7 +87,7 @@ Settings live in `~/.config/mailidx/config.toml`. Change them with `mailidx conf
 
 | Key | Default | What it does |
 |---|---|---|
-| `send_locked` | `false` | Tools can only save drafts. `send: true` and `drafts send` are refused. |
+| `send_locked` | `false` | Tools can only save drafts. `send: true`, `drafts send` and `unsubscribe` are refused. |
 | `hidden_accounts` | none | Account names no tool can see, comma-separated. |
 | `hidden_mailboxes` | none | Mailbox paths such as `Privat` or `iCloud/Business/Clients`, including their subfolders. Hidden mail is not indexed and cannot be opened by id. |
 | `update_check` | `true` | Ask GitHub at most once a day whether a newer release exists. |

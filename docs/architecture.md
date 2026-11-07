@@ -21,7 +21,7 @@ The index file is attached to the read-only Envelope Index connection, so one qu
 
 ### Inline images
 
-An image counts as inline when the HTML part shows it through a `cid:` reference and it is at most 64 KB. That covers signature logos and icons. Larger embedded images are usually photos the sender meant to send, so they stay attachments.
+An image counts as inline when it is at most 64 KB and either the HTML part shows it through a `cid:` reference or, as Apple Mail sends it, it sits between the HTML parts marked `Content-Disposition: inline`. That covers signature logos and icons. Larger embedded images are usually photos the sender meant to send, so they stay attachments.
 
 ### Codes and confirm links
 
@@ -44,6 +44,6 @@ Every change goes through Mail with AppleScript, run by `/usr/bin/osascript`. Va
 mailidx itself makes two kinds of requests:
 
 - At most once a day it asks GitHub whether a newer release exists. `update_check = false` turns that off.
-- `unsubscribe` with a one-click sender sends one HTTPS POST to the address in that sender's `List-Unsubscribe` header, as RFC 8058 defines. Only when an agent calls it with `action: "unsubscribe"`. Plain `http` is refused.
+- `unsubscribe` with a one-click sender sends one HTTPS POST to the address in that sender's `List-Unsubscribe` header, as RFC 8058 defines. Only when an agent calls it with `action: "unsubscribe"`, and never with `send_locked` on. Plain `http` is refused.
 
 Sending mail is Mail's job and uses your accounts as configured there.
