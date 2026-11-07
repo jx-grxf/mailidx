@@ -61,6 +61,7 @@ pub fn codes(text: &str) -> Vec<String> {
         if !next_is_glue && looks_like_code(&token) {
             let dist = keyword_at
                 .iter()
+                .filter(|&&k| i >= subject_end || k < subject_end)
                 .map(|&k| if k <= i { i - k } else { (k - i) * 2 })
                 .min()
                 .unwrap_or(usize::MAX);
@@ -73,6 +74,11 @@ pub fn codes(text: &str) -> Vec<String> {
             }
         }
         i = end.max(i + 1);
+    }
+    // A bare number in the subject is only a guess; once a code sits next to a
+    // keyword, it is more likely a ticket number or time.
+    if scored.iter().any(|(r, _)| *r <= 80) {
+        scored.retain(|(r, _)| *r <= 80);
     }
     scored.sort_by_key(|(r, _)| *r);
     scored.into_iter().map(|(_, t)| t).take(3).collect()
@@ -169,6 +175,7 @@ mod tests {
         assert_eq!(codes("482913 is your Instagram code\nHi"), vec!["482913"]);
         assert_eq!(codes("Login-Code\nUse AB12CD9 to sign in"), vec!["AB12CD9"]);
         assert_eq!(codes("G-772041 ist dein Google-Bestätigungscode"), vec!["772041"]);
+        assert_eq!(codes("Volltest 202051\nDein Bestätigungscode lautet 739204."), vec!["739204"]);
     }
 
     #[test]

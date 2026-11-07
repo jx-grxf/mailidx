@@ -2,6 +2,8 @@ use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use mail_parser::Message;
 use serde::Serialize;
 
+use crate::emlx::{self, Emlx};
+
 #[derive(Debug, Default, Serialize, PartialEq)]
 pub struct Invite {
     /// REQUEST (invitation or update), CANCEL, REPLY, PUBLISH.
@@ -26,7 +28,8 @@ pub struct Invite {
     pub uid: String,
 }
 
-pub fn invites(msg: &Message<'_>) -> Vec<Invite> {
+/// `emlx` is needed for `.partial.emlx`, where Mail keeps the .ics in a separate file.
+pub fn invites(emlx: Option<&Emlx>, msg: &Message<'_>) -> Vec<Invite> {
     let mut out = Vec::new();
     for part in msg.parts() {
         let is_cal = part.content_type().is_some_and(|c| {
@@ -36,7 +39,14 @@ pub fn invites(msg: &Message<'_>) -> Vec<Invite> {
         if !is_cal {
             continue;
         }
-        let text = String::from_utf8_lossy(&part.decoded()).into_owned();
+        let mut data = part.decoded().into_owned();
+        if data.is_empty()
+            && let Some(e) = emlx.filter(|e| e.partial)
+            && let Some(p) = emlx::partial_attachment_path(e, part.attachment_name().unwrap_or(""))
+        {
+            data = std::fs::read(p).unwrap_or_default();
+        }
+        let text = String::from_utf8_lossy(&data).into_owned();
         for inv in parse(&text) {
             if !out.iter().any(|o: &Invite| o.uid == inv.uid && o.start == inv.start) {
                 out.push(inv);
@@ -172,7 +182,7 @@ Content-Type: multipart/mixed; boundary=XX\r\n\r\n--XX\r\nContent-Type: text/pla
 QkVHSU46VkNBTEVOREFSDQpNRVRIT0Q6UkVRVUVTVA0KQkVHSU46VkVWRU5UDQpVSUQ6dTENClNVTU1BUlk6VGVzdA0KRFRTVEFSVDtWQUxVRT1EQVRFOjIwMjYxMjAxDQpFTkQ6VkVWRU5UDQpFTkQ6VkNBTEVOREFSDQo=\r\n\
 --XX--\r\n";
         let msg = crate::emlx::parse(raw.as_bytes()).unwrap();
-        let v = invites(&msg);
+        let v = invites(None, &msg);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].summary, "Test");
         assert_eq!(v[0].method, "REQUEST");
