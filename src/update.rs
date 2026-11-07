@@ -79,15 +79,26 @@ fn curl(args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+// The redirect of /releases/latest names the tag. api.github.com would too, but it
+// allows 60 requests an hour per IP without a token and then answers 403.
 fn fetch_latest() -> Result<String> {
-    let body = curl(&[
-        "-H",
-        "Accept: application/vnd.github+json",
-        &format!("https://api.github.com/repos/{REPO}/releases/latest"),
-    ])?;
-    let v: serde_json::Value = serde_json::from_slice(&body).context("GitHub sent an unexpected answer")?;
-    let tag = v["tag_name"].as_str().ok_or_else(|| anyhow!("latest release has no tag"))?;
-    Ok(tag.trim_start_matches('v').to_string())
+    let out = Command::new("/usr/bin/curl")
+        .args(["-fsS", "--max-time", "30", "-A", &format!("mailidx/{CURRENT}")])
+        .args(["-o", "/dev/null", "-w", "%{redirect_url}"])
+        .arg(format!("https://github.com/{REPO}/releases/latest"))
+        .output()
+        .context("cannot run curl")?;
+    if !out.status.success() {
+        bail!("cannot reach GitHub: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    tag_from_redirect(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| anyhow!("GitHub did not name a latest release"))
+}
+
+fn tag_from_redirect(url: &str) -> Option<String> {
+    let tag = url.trim().rsplit_once("/releases/tag/")?.1;
+    let v = tag.strip_prefix('v').unwrap_or(tag);
+    (!v.is_empty() && v.starts_with(|c: char| c.is_ascii_digit())).then(|| v.to_string())
 }
 
 fn parts(v: &str) -> Vec<u64> {
@@ -145,7 +156,15 @@ fn install_into(version: &str, tmp: &Path, dir: &Path, target: &Path) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::newer;
+    use super::{newer, tag_from_redirect};
+
+    #[test]
+    fn reads_tag_from_redirect() {
+        let u = "https://github.com/jx-grxf/mailidx/releases/tag/v0.3.0";
+        assert_eq!(tag_from_redirect(u).as_deref(), Some("0.3.0"));
+        assert_eq!(tag_from_redirect("https://github.com/jx-grxf/mailidx/releases"), None);
+        assert_eq!(tag_from_redirect(""), None);
+    }
 
     #[test]
     fn compares_versions_numerically() {
