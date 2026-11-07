@@ -401,8 +401,22 @@ const GUI_BODY: &str = r#"
     end try
 "#;
 
+/// With the screen locked macOS brings no window to the front and Accessibility
+/// sees none, so the paste would fail after Mail had already saved an empty draft.
+async fn screen_locked() -> bool {
+    let Ok(out) = Command::new("/usr/sbin/ioreg").args(["-n", "Root", "-d1", "-a"]).output().await else {
+        return false;
+    };
+    let xml = String::from_utf8_lossy(&out.stdout);
+    xml.split_once("<key>CGSSessionScreenIsLocked</key>")
+        .is_some_and(|(_, rest)| rest.trim_start().starts_with("<true/>"))
+}
+
 pub async fn compose_window(kind: Kind, orig: Option<&MsgRef>, o: &Outgoing) -> Result<(String, String)> {
     let _guard = GUI_LOCK.lock().await;
+    if screen_locked().await {
+        bail!("the Mac's screen is locked, so Mail cannot open its compose window. Nothing was created; try again once the user has unlocked it.");
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -480,6 +494,14 @@ pub async fn create_mailbox(account: &str, name: &str) -> Result<String> {
     set acc to item 1 of argv
     set nm to item 2 of argv
     tell application "Mail"
+        try
+            if acc is "" then
+                get name of mailbox nm
+            else
+                get name of mailbox nm of account acc
+            end if
+            return "exists"
+        end try
         if acc is "" then
             make new mailbox with properties {name:nm}
         else

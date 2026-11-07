@@ -32,7 +32,7 @@ impl Default for Config {
 
 pub const KEYS: &[(&str, &str)] = &[
     ("update_check", "true/false: check GitHub once a day for a newer release"),
-    ("send_locked", "true/false: tools may only save drafts, never send"),
+    ("send_locked", "true/false: tools may only save drafts, never send or unsubscribe"),
     ("hidden_accounts", "comma-separated account names that no tool sees"),
     ("hidden_mailboxes", "comma-separated mailbox paths (or Account/Path) that no tool sees"),
     ("index_path", "path of the search index file (empty = default)"),

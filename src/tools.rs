@@ -25,11 +25,14 @@ use crate::update;
 
 type ToolResult = std::result::Result<CallToolResult, ErrorData>;
 
+/// Account name and its addresses, as Mail reports them.
+type AccountAddresses = Vec<(String, Vec<String>)>;
+
 struct Inner {
     store: Mutex<Store>,
     index: Mutex<Index>,
     last_refresh: Mutex<Instant>,
-    my_addresses: tokio::sync::Mutex<Option<Vec<(String, Vec<String>)>>>,
+    my_addresses: tokio::sync::Mutex<Option<AccountAddresses>>,
     config: Config,
     update: Mutex<Option<update::Status>>,
     update_noticed: AtomicBool,
@@ -553,7 +556,7 @@ pub struct BulkFilter {
     pub from: Option<String>,
     pub to: Option<String>,
     pub subject: Option<String>,
-    /// Default: every mailbox except trash and junk.
+    /// Default: every mailbox except trash, junk, sent, drafts and outbox. Name one to include it.
     pub mailbox: Option<String>,
     pub account: Option<String>,
     pub since: Option<String>,
@@ -650,8 +653,9 @@ fn parse_mailto(m: &str) -> (String, Option<String>, Option<String>) {
 
 fn bulk_select(s: &mut Store, index: &Mutex<Index>, b: &BulkFilter) -> Result<Vec<MessageRow>> {
     let mut f = base_filter(s, b.mailbox.as_deref(), b.account.as_deref(), b.since.as_deref(), b.until.as_deref())?;
+    // Your own sent mail and open drafts are never what a clean-up filter means.
     if b.mailbox.is_none() {
-        f.exclude_mailbox_ids = s.role_ids(&[Role::Trash, Role::Junk]);
+        f.exclude_mailbox_ids = s.role_ids(&[Role::Trash, Role::Junk, Role::Sent, Role::Drafts, Role::Outbox]);
     }
     f.from = b.from.clone();
     f.to = b.to.clone();
@@ -781,7 +785,10 @@ impl Server {
     )]
     async fn list_messages(&self, Parameters(a): Parameters<ListArgs>) -> ToolResult {
         let out = tri!(
-            self.with(move |s, _| {
+            self.with(move |s, index| {
+                // Attachment counts and has_invite read the index; mail that arrived a
+                // moment ago must be in it.
+                index.lock().map_err(|_| anyhow!("index lock poisoned"))?.sync(s)?;
                 let mailbox = a.mailbox.clone().unwrap_or_else(|| "inbox".into());
                 let mut f = base_filter(
                     s,
@@ -838,6 +845,7 @@ impl Server {
                 let limit = a.limit.clamp(1, 500);
                 let query = a.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
                 let Some(q) = query else {
+                    index.lock().map_err(|_| anyhow!("index lock poisoned"))?.sync(s)?;
                     f.limit = limit;
                     f.offset = a.offset;
                     let rows = s.list(&f)?;
@@ -995,7 +1003,7 @@ impl Server {
                     if a.links {
                         v["links"] = json!(emlx::links(m));
                     }
-                    let invites = ical::invites(m);
+                    let invites = ical::invites(Some(e), m);
                     if !invites.is_empty() {
                         v["invites"] = json!(invites);
                     }
@@ -1489,13 +1497,26 @@ impl Server {
         }
         let mut refs = Vec::new();
         let mut first_account = String::new();
+        // One stale id (moved or deleted since the agent saw it) must not block the rest.
+        let mut missing: Vec<String> = Vec::new();
+        let mut found_ids = Vec::new();
         for id in &ids {
-            let (r, row) = tri!(self.msg_ref(*id).await);
-            if first_account.is_empty() {
-                first_account = row.account.clone();
+            match self.msg_ref(*id).await {
+                Ok((r, row)) => {
+                    if first_account.is_empty() {
+                        first_account = row.account.clone();
+                    }
+                    refs.push(r);
+                    found_ids.push(*id);
+                }
+                Err(e) => missing.push(format!("{e:#}")),
             }
-            refs.push(r);
         }
+        if refs.is_empty() {
+            return fail(anyhow!("{}", missing.join("; ")));
+        }
+        let requested = ids.len();
+        let ids = found_ids;
         let flag_color = match a.action.as_str() {
             "flag_color" => match a.color.as_deref().unwrap_or("red") {
                 "red" => 0,
@@ -1505,7 +1526,7 @@ impl Server {
                 "blue" => 4,
                 "purple" => 5,
                 "gray" | "grey" => 6,
-                c => return fail(anyhow!("unknown color '{c}'")),
+                c => return fail(anyhow!("unknown color '{c}'; use red, orange, yellow, green, blue, purple or gray")),
             },
             _ => 0,
         };
@@ -1540,7 +1561,7 @@ impl Server {
             None
         };
         let mut done = 0usize;
-        let mut errors: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = missing;
         for chunk in refs.chunks(CHUNK) {
             let res = match a.action.as_str() {
                 "mark_read" => script::set_status(chunk, "read", "true").await,
@@ -1570,7 +1591,7 @@ impl Server {
                 }
             }
         }
-        let mut result = json!({ "action": a.action, "changed": done, "requested": ids.len(), "errors": errors });
+        let mut result = json!({ "action": a.action, "changed": done, "requested": requested, "errors": errors });
         if let Some((_, _, mailbox_id, globals)) = dest
             && done > 0
         {
@@ -1598,6 +1619,16 @@ impl Server {
             }
             "trash" => {
                 let Some(id) = a.id else { return fail(anyhow!("trash needs an id")) };
+                tri!(
+                    self.with(move |s, _| {
+                        let row = s.get(id)?;
+                        if s.mailbox(row.mailbox_id).map(|m| m.role) != Some(Role::Drafts) {
+                            bail!("message {id} is not a draft; use update_messages with action trash for other mail");
+                        }
+                        Ok(())
+                    })
+                    .await
+                );
                 let (r, _) = tri!(self.msg_ref(id).await);
                 tri!(script::trash(&[r]).await);
                 ok(&json!({ "trashed": id }))
@@ -1722,6 +1753,13 @@ impl Server {
         if a.action.as_deref() != Some("unsubscribe") {
             return fail(anyhow!("unknown action (list, unsubscribe)"));
         }
+        // A one-click POST sends no mail but acts on the user's behalf just the same.
+        if self.inner.config.send_locked {
+            return fail(anyhow!(
+                "unsubscribing is locked with sending (send_locked = true); \
+                 the user can run `mailidx config set send_locked false`"
+            ));
+        }
         let target = match (a.id, a.sender.as_deref()) {
             (Some(id), _) => msgs.iter().find(|m| m.id == id),
             (None, Some(sender)) => {
@@ -1788,7 +1826,8 @@ impl Server {
     async fn contacts(&self, Parameters(a): Parameters<ContactArgs>) -> ToolResult {
         let me: HashSet<String> = self.me().await.into_iter().map(|x| x.to_lowercase()).collect();
         let (received, sent, lists) = tri!(
-            self.with(|s, _| {
+            self.with(|s, index| {
+                index.lock().map_err(|_| anyhow!("index lock poisoned"))?.sync(s)?;
                 let skip = s.role_ids(&[Role::Sent, Role::Drafts, Role::Outbox, Role::Trash, Role::Junk]);
                 let sent_ids = s.role_ids(&[Role::Sent]);
                 let lists: HashSet<String> =
@@ -1857,7 +1896,11 @@ impl Server {
             Some(x) => x,
             None => self.default_account().await,
         };
-        if tri!(script::create_mailbox(&account, &a.name).await) != "ok" {
+        let res = tri!(script::create_mailbox(&account, &a.name).await);
+        if res == "exists" {
+            return fail(anyhow!("mailbox '{}' already exists in {account}", a.name));
+        }
+        if res != "ok" {
             return fail(anyhow!(
                 "Mail has not shown mailbox '{}' after 3 s. On IMAP accounts the server can take longer; \
                  check the mailboxes tool before trying again.",
@@ -1920,6 +1963,12 @@ impl Server {
 
     #[tool(description = "Ask Mail to fetch new mail and sync an account (or all accounts).")]
     async fn check_mail(&self, Parameters(a): Parameters<AccountArg>) -> ToolResult {
+        if let Some(name) = a.account.as_deref() {
+            let names: Vec<String> = tri!(self.with(|s, _| Ok(s.accounts().into_iter().map(|x| x.name).collect())).await);
+            if !names.iter().any(|n| n == name) {
+                return fail(anyhow!("no account '{name}'; accounts: {}", names.join(", ")));
+            }
+        }
         tri!(script::check_mail(a.account.as_deref().unwrap_or("")).await);
         ok(&json!({ "status": "requested", "account": a.account }))
     }

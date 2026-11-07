@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::emlx;
 use crate::store::Store;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const INCOMPLETE_RECHECK_SECS: u64 = 60;
 
 pub struct Index {
@@ -293,7 +293,7 @@ fn build_doc(id: i64, path: Option<PathBuf>, fallback: Option<String>) -> Doc {
                     attachments: names.join(" "),
                     inline,
                     unsubscribe: emlx::unsubscribe(&msg),
-                    invite: !crate::ical::invites(&msg).is_empty(),
+                    invite: !crate::ical::invites(Some(&e), &msg).is_empty(),
                 };
             }
     let fb = fallback.unwrap_or_default();
