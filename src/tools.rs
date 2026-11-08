@@ -895,7 +895,7 @@ impl Server {
         let deadline = start + std::time::Duration::from_secs(a.timeout_seconds.clamp(1, 600));
         let since = tri!(a.since.as_deref().map(parse_when).transpose());
         // Taken before fetching, so a message Mail stores during the fetch is already "new".
-        let baseline = tri!(self.with(|s, _| Ok(s.fingerprint()?.0)).await);
+        let baseline = tri!(self.with(|s, _| s.max_global_id()).await);
         let fetch = a.fetch.then(|| {
             let account = a.account.clone().unwrap_or_default();
             tokio::spawn(async move { script::check_mail(&account).await })
@@ -912,16 +912,18 @@ impl Server {
                     }
                     match since {
                         Some(t) => f.since = Some(t),
-                        None => f.after_id = Some(baseline),
+                        None => f.after_global_id = Some(baseline),
                     }
                     f.from = args.from.clone();
                     f.to = args.to.clone();
                     f.subject = args.subject.clone();
+                    // New mail must be indexed before its attachment count drops the inline logos.
+                    let mut idx = index.lock().map_err(|_| anyhow!("index lock poisoned"))?;
+                    idx.sync(s)?;
                     if let Some(q) = args.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
-                        let mut idx = index.lock().map_err(|_| anyhow!("index lock poisoned"))?;
-                        idx.sync(s)?;
                         f.ids = Some(idx.search(q, false, false, 20_000)?.into_iter().map(|h| h.id).collect());
                     }
+                    drop(idx);
                     f.limit = limit;
                     let rows = s.list(&f)?;
                     let mut out = Vec::with_capacity(rows.len());

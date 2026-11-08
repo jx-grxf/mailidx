@@ -139,7 +139,9 @@ pub struct Recipient {
 #[derive(Debug, Default, Clone)]
 pub struct Filter {
     pub ids: Option<Vec<i64>>,
-    pub after_id: Option<i64>,
+    /// Only messages Mail first saw after this `message_global_data` row. A move
+    /// gives a message a new ROWID but keeps its global id, so moved mail is not new.
+    pub after_global_id: Option<i64>,
     pub mailbox_ids: Option<Vec<i64>>,
     pub exclude_mailbox_ids: Vec<i64>,
     pub from: Option<String>,
@@ -444,8 +446,8 @@ impl Store {
             }
             in_list(&mut sql, "m.ROWID", ids, false);
         }
-        if let Some(id) = f.after_id {
-            sql.push_str(" AND m.ROWID > ?");
+        if let Some(id) = f.after_global_id {
+            sql.push_str(" AND m.global_message_id > ?");
             args.push(id.into());
         }
         if let Some(mbs) = &f.mailbox_ids {
@@ -763,6 +765,10 @@ impl Store {
         let mut st = self.conn.prepare(sql)?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn max_global_id(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COALESCE(MAX(ROWID),0) FROM message_global_data", [], |r| r.get(0))?)
     }
 
     pub fn fingerprint(&self) -> Result<(i64, i64)> {
