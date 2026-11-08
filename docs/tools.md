@@ -82,7 +82,7 @@ Full-text search over subject, sender, recipients, body and attachment names, co
 
 Waits until a new message that matches arrives, then returns it. Built for tests like "did the contact form mail come through?".
 
-- Only mail that arrives after the call counts. With `since` (for example the time you submitted the form), mail that arrived a moment earlier counts too.
+- Only mail that arrives after the call counts; a message moved or trashed meanwhile is not new. With `since` (for example the time you submitted the form), mail that arrived a moment earlier counts too.
 - It asks Mail to fetch first (`fetch: false` turns that off) and then checks every two seconds until `timeout_seconds` (default 60, at most 600).
 - It looks at incoming mail only. Sent, outbox and drafts are skipped, junk and trash are included, and every result names its mailbox. A form mail that landed in spam comes back with `"mailbox": "Junk"`.
 - `extract: true` adds the one-time code and the confirm link, as in `get_message`.
@@ -106,7 +106,7 @@ Write tools need the Automation permission for Mail. `compose`, `reply` and `for
 
 New mail, a reply (with `reply_all`) or a forward, through Mail's compose window. Your signature, the quoted original and forwarded attachments look as they do when you click the button yourself. Mail comes to the front for about two seconds.
 
-Everything is saved as a draft unless the call passes `send: true`. With `send_locked` in the settings, sending is refused.
+Everything is saved as a draft unless the call passes `send: true`. With `send_locked` in the settings, sending is refused. While the Mac's screen is locked these tools refuse too, because macOS shows no window then.
 
 ### `drafts`
 
